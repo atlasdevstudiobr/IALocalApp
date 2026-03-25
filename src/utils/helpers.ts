@@ -34,6 +34,27 @@ export function formatDate(timestamp: number): string {
 }
 
 /**
+ * Formats bytes into a human-readable string (KB, MB, GB).
+ */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '0 B';
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unitIndex = 0;
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+
+  const fractionDigits = value >= 100 || unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(fractionDigits)} ${units[unitIndex]}`;
+}
+
+/**
  * Truncates text to a maximum length, appending ellipsis if needed.
  */
 export function truncateText(text: string, maxLength: number): string {

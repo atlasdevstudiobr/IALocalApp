@@ -1,14 +1,68 @@
 import React from 'react';
 import {View, Text, TouchableOpacity, StyleSheet} from 'react-native';
+import {ModelStatus} from '../types';
 import {colors, spacing, fonts, radius} from '../theme';
+import {formatBytes} from '../utils/helpers';
 
 interface ModelStatusCardProps {
-  onDownloadPress?: () => void;
+  status: ModelStatus;
+  progress: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  errorMessage?: string;
+  onActionPress?: () => void;
 }
 
 export default function ModelStatusCard({
-  onDownloadPress,
+  status,
+  progress,
+  downloadedBytes,
+  totalBytes,
+  errorMessage,
+  onActionPress,
 }: ModelStatusCardProps): React.JSX.Element {
+  const isDownloading = status === 'downloading';
+  const isReady = status === 'ready';
+  const isError = status === 'error';
+
+  const statusText =
+    status === 'downloading'
+      ? 'Baixando'
+      : status === 'ready'
+      ? 'Baixado'
+      : status === 'error'
+      ? 'Erro no download'
+      : 'Nao instalado';
+
+  const statusDotColor =
+    status === 'downloading'
+      ? colors.warning
+      : status === 'ready'
+      ? colors.success
+      : status === 'error'
+      ? colors.danger
+      : colors.textMuted;
+
+  const buttonText =
+    status === 'downloading'
+      ? 'Cancelar download'
+      : status === 'ready'
+      ? 'Modelo baixado'
+      : status === 'error'
+      ? 'Tentar novamente'
+      : 'Baixar modelo';
+
+  const progressValue = isReady ? 100 : Math.max(0, Math.min(100, progress));
+  const progressWidth = `${progressValue}%`;
+
+  const bytesText = `${formatBytes(downloadedBytes)} / ${formatBytes(totalBytes)}`;
+
+  const infoText = isError
+    ? errorMessage || 'Nao foi possivel baixar o modelo. Tente novamente.'
+    : isReady
+    ? `Modelo salvo localmente em: ${formatBytes(downloadedBytes)}`
+    : 'O modelo de IA local precisa ser baixado antes de usar o app offline. Necessario ~2 GB de espaco livre.';
+
   return (
     <View style={styles.card}>
       <View style={styles.header}>
@@ -24,33 +78,40 @@ export default function ModelStatusCard({
       {/* Status Badge */}
       <View style={styles.statusRow}>
         <View style={styles.statusBadge}>
-          <View style={styles.statusDot} />
-          <Text style={styles.statusText}>Nao instalado</Text>
+          <View style={[styles.statusDot, {backgroundColor: statusDotColor}]} />
+          <Text style={styles.statusText}>{statusText}</Text>
         </View>
       </View>
 
-      {/* Progress bar placeholder */}
+      {/* Progress */}
       <View style={styles.progressBarContainer}>
         <View style={styles.progressBarTrack}>
-          <View style={[styles.progressBarFill, {width: '0%'}]} />
+          <View style={[styles.progressBarFill, {width: progressWidth}]} />
         </View>
-        <Text style={styles.progressText}>0%</Text>
+        <Text style={styles.progressText}>{Math.round(progressValue)}%</Text>
       </View>
+      <Text style={styles.sizeText}>{bytesText}</Text>
 
       {/* Info text */}
-      <Text style={styles.infoText}>
-        O modelo de IA local precisa ser baixado antes de usar o app offline.
-        Necessario ~2 GB de espaco livre.
-      </Text>
+      <Text style={styles.infoText}>{infoText}</Text>
 
-      {/* Download button */}
+      {/* Action button */}
       <TouchableOpacity
-        style={styles.downloadButton}
-        onPress={onDownloadPress}
-        disabled
+        style={[
+          styles.downloadButton,
+          isDownloading ? styles.downloadButtonDanger : null,
+          isReady ? styles.downloadButtonReady : null,
+        ]}
+        onPress={onActionPress}
+        disabled={isReady}
         activeOpacity={0.8}>
-        <Text style={styles.downloadButtonText}>Baixar modelo</Text>
-        <Text style={styles.downloadButtonSubtext}>(Em breve)</Text>
+        <Text
+          style={[
+            styles.downloadButtonText,
+            isReady ? styles.downloadButtonTextReady : null,
+          ]}>
+          {buttonText}
+        </Text>
       </TouchableOpacity>
     </View>
   );
@@ -141,6 +202,11 @@ const styles = StyleSheet.create({
     fontSize: fonts.sizes.xs,
     minWidth: 32,
   },
+  sizeText: {
+    color: colors.textMuted,
+    fontSize: fonts.sizes.xs,
+    marginBottom: spacing.sm,
+  },
   infoText: {
     color: colors.textSecondary,
     fontSize: fonts.sizes.xs,
@@ -148,23 +214,30 @@ const styles = StyleSheet.create({
     marginBottom: spacing.lg,
   },
   downloadButton: {
-    flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.border,
+    backgroundColor: colors.primary,
     borderRadius: radius.md,
     paddingVertical: spacing.md,
     paddingHorizontal: spacing.lg,
-    opacity: 0.6,
+  },
+  downloadButtonDanger: {
+    backgroundColor: 'rgba(239,68,68,0.15)',
+    borderWidth: 1,
+    borderColor: 'rgba(239,68,68,0.45)',
+  },
+  downloadButtonReady: {
+    backgroundColor: 'rgba(16,185,129,0.15)',
+    borderWidth: 1,
+    borderColor: 'rgba(16,185,129,0.45)',
+    opacity: 0.8,
   },
   downloadButtonText: {
-    color: colors.textSecondary,
+    color: '#FFFFFF',
     fontSize: fonts.sizes.base,
     fontWeight: '600',
-    marginRight: spacing.xs,
   },
-  downloadButtonSubtext: {
-    color: colors.textMuted,
-    fontSize: fonts.sizes.xs,
+  downloadButtonTextReady: {
+    color: colors.success,
   },
 });

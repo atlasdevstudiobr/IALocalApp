@@ -1,4 +1,4 @@
-import React, {useCallback} from 'react';
+import React, {useCallback, useEffect, useState} from 'react';
 import {
   View,
   Text,
@@ -12,6 +12,13 @@ import {useNavigation, DrawerActions} from '@react-navigation/native';
 import ModelStatusCard from '../components/ModelStatusCard';
 import LogsViewer from '../components/LogsViewer';
 import {colors, spacing, fonts, radius} from '../theme';
+import {
+  ModelDownloadState,
+  cancelModelDownload,
+  isModelDownloadInProgress,
+  loadModelDownloadState,
+  startModelDownload,
+} from '../services/modelDownloadService';
 
 const APP_VERSION = '1.0.0';
 const RN_VERSION = '0.73.6';
@@ -19,10 +26,76 @@ const RN_VERSION = '0.73.6';
 export default function SettingsScreen(): React.JSX.Element {
   const insets = useSafeAreaInsets();
   const navigation = useNavigation();
+  const [modelState, setModelState] = useState<ModelDownloadState | null>(null);
 
   const handleOpenDrawer = useCallback(() => {
     navigation.dispatch(DrawerActions.openDrawer());
   }, [navigation]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadState = async () => {
+      const currentState = await loadModelDownloadState();
+      if (isMounted) {
+        setModelState(currentState);
+      }
+    };
+
+    void loadState();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const handleModelAction = useCallback(async () => {
+    if (!modelState) {
+      return;
+    }
+
+    if (modelState.status === 'downloading') {
+      if (!isModelDownloadInProgress()) {
+        const refreshedState = await loadModelDownloadState();
+        setModelState(refreshedState);
+        return;
+      }
+      await cancelModelDownload();
+      return;
+    }
+
+    if (isModelDownloadInProgress()) {
+      return;
+    }
+
+    setModelState(prev =>
+      prev
+        ? {
+            ...prev,
+            status: 'downloading',
+            downloadProgress: 0,
+            downloadedBytes: 0,
+            errorMessage: undefined,
+          }
+        : prev,
+    );
+
+    const finalState = await startModelDownload({
+      onProgress: update => {
+        setModelState(prev =>
+          prev
+            ? {
+                ...prev,
+                status: 'downloading',
+                ...update,
+              }
+            : prev,
+        );
+      },
+    });
+
+    setModelState(finalState);
+  }, [modelState]);
 
   return (
     <View style={[styles.container, {paddingTop: insets.top}]}>
@@ -48,7 +121,14 @@ export default function SettingsScreen(): React.JSX.Element {
 
         {/* Model section */}
         <Text style={styles.sectionTitle}>Modelo de IA</Text>
-        <ModelStatusCard />
+        <ModelStatusCard
+          status={modelState?.status ?? 'not_downloaded'}
+          progress={modelState?.downloadProgress ?? 0}
+          downloadedBytes={modelState?.downloadedBytes ?? 0}
+          totalBytes={modelState?.totalBytes ?? 0}
+          errorMessage={modelState?.errorMessage}
+          onActionPress={handleModelAction}
+        />
 
         {/* App info section */}
         <Text style={styles.sectionTitle}>Informacoes do App</Text>
