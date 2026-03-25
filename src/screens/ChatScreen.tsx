@@ -7,7 +7,6 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
-  ActivityIndicator,
   ListRenderItem,
 } from 'react-native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
@@ -20,6 +19,7 @@ import {generateResponse} from '../services/aiService';
 import {logError, logInfo} from '../services/logService';
 import ChatBubble from '../components/ChatBubble';
 import ChatInput from '../components/ChatInput';
+import {useKeyboardHeight} from '../hooks/useKeyboardHeight';
 import {colors, spacing, fonts, radius} from '../theme';
 import {RootStackParamList} from '../navigation/AppNavigator';
 import {truncateText} from '../utils/helpers';
@@ -31,6 +31,7 @@ const TAG = 'ChatScreen';
 
 export default function ChatScreen(): React.JSX.Element {
   const insets = useSafeAreaInsets();
+  const keyboardHeight = useKeyboardHeight();
   const navigation = useNavigation<NavigationProp>();
   const route = useRoute<ChatScreenRouteProp>();
   const {state, addMessage, updateLastMessage, setLoading, setCurrentConversation} =
@@ -71,7 +72,7 @@ export default function ChatScreen(): React.JSX.Element {
       content: trimmed,
     });
 
-    // Add placeholder assistant message
+    // Add placeholder assistant message (shows TypingIndicator while empty)
     const assistantMsg = addMessage(conversationId, {
       role: 'assistant',
       content: '',
@@ -99,11 +100,9 @@ export default function ChatScreen(): React.JSX.Element {
       logError(TAG, 'Failed to generate AI response', errorMessage);
     } finally {
       setLoading(false);
-      // Scroll to top of inverted list (newest message)
       flatListRef.current?.scrollToOffset({offset: 0, animated: true});
     }
 
-    // Suppress unused var warning for assistantMsg
     void assistantMsg;
   }, [
     inputText,
@@ -128,6 +127,12 @@ export default function ChatScreen(): React.JSX.Element {
 
   const title = conversation?.title ?? 'Nova Conversa';
 
+  // On Android, adjustResize in AndroidManifest handles the keyboard resize.
+  // We only need to compensate the bottom safe area inset when keyboard is hidden.
+  const bottomSpacerHeight = Platform.OS === 'android'
+    ? (keyboardHeight > 0 ? 0 : insets.bottom)
+    : insets.bottom;
+
   return (
     <View style={[styles.container, {paddingTop: insets.top}]}>
       {/* Header */}
@@ -141,24 +146,15 @@ export default function ChatScreen(): React.JSX.Element {
         <Text style={styles.headerTitle} numberOfLines={1}>
           {truncateText(title, 30)}
         </Text>
-        <View style={styles.headerRight}>
-          {isLoading && (
-            <ActivityIndicator
-              size="small"
-              color={colors.primary}
-              style={styles.loadingIndicator}
-            />
-          )}
-        </View>
+        <View style={styles.headerRight} />
       </View>
 
-      {/* Messages + Input wrapped in KeyboardAvoidingView */}
+      {/* Messages + Input */}
       <KeyboardAvoidingView
         style={styles.keyboardAvoid}
-        behavior={Platform.OS === 'android' ? 'height' : 'padding'}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         keyboardVerticalOffset={0}>
 
-        {/* Messages list */}
         {messages.length === 0 ? (
           <View style={styles.emptyChat}>
             <View style={styles.emptyChatIcon}>
@@ -183,7 +179,6 @@ export default function ChatScreen(): React.JSX.Element {
           />
         )}
 
-        {/* Input bar */}
         <ChatInput
           value={inputText}
           onChangeText={setInputText}
@@ -191,8 +186,7 @@ export default function ChatScreen(): React.JSX.Element {
           isLoading={isLoading}
         />
 
-        {/* Bottom safe area padding */}
-        <View style={{height: insets.bottom}} />
+        <View style={{height: bottomSpacerHeight}} />
       </KeyboardAvoidingView>
     </View>
   );
@@ -228,11 +222,6 @@ const styles = StyleSheet.create({
   },
   headerRight: {
     width: 36,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  loadingIndicator: {
-    marginLeft: spacing.sm,
   },
   keyboardAvoid: {
     flex: 1,

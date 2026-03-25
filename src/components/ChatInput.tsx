@@ -48,7 +48,7 @@ export default function ChatInput({
           placeholder={placeholder}
           placeholderTextColor={colors.textMuted}
           multiline
-          maxHeight={120}
+          maxLength={4000}
           numberOfLines={1}
           returnKeyType="send"
           blurOnSubmit={false}
@@ -59,7 +59,10 @@ export default function ChatInput({
           selectionColor={colors.primary}
         />
         <TouchableOpacity
-          style={[styles.sendButton, canSend ? styles.sendButtonActive : styles.sendButtonDisabled]}
+          style={[
+            styles.sendButton,
+            canSend ? styles.sendButtonActive : styles.sendButtonDisabled,
+          ]}
           onPress={handleSend}
           disabled={!canSend}
           activeOpacity={0.8}>
@@ -78,9 +81,12 @@ const styles = StyleSheet.create({
   container: {
     backgroundColor: colors.background,
     paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.sm,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
+    paddingVertical: spacing.md,
+    shadowColor: '#000000',
+    shadowOffset: {width: 0, height: -3},
+    shadowOpacity: 0.2,
+    shadowRadius: 10,
+    elevation: 10,
   },
   inputRow: {
     flexDirection: 'row',
@@ -92,6 +98,11 @@ const styles = StyleSheet.create({
     paddingLeft: spacing.md,
     paddingRight: spacing.xs,
     paddingVertical: spacing.xs,
+    shadowColor: colors.primary,
+    shadowOffset: {width: 0, height: 0},
+    shadowOpacity: 0.08,
+    shadowRadius: 6,
+    elevation: 2,
   },
   input: {
     flex: 1,

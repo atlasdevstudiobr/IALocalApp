@@ -1,9 +1,10 @@
-import React, {useCallback} from 'react';
+import React, {useCallback, useRef, useEffect} from 'react';
 import {
   View,
   Text,
   TouchableOpacity,
   StyleSheet,
+  Animated,
 } from 'react-native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {useNavigation, DrawerActions} from '@react-navigation/native';
@@ -19,6 +20,38 @@ export default function HomeScreen(): React.JSX.Element {
   const insets = useSafeAreaInsets();
   const navigation = useNavigation<NavigationProp>();
   const {createConversation, setCurrentConversation} = useChatStore();
+
+  const logoAnim = useRef(new Animated.Value(0)).current;
+  const titleAnim = useRef(new Animated.Value(0)).current;
+  const subtitleAnim = useRef(new Animated.Value(0)).current;
+  const pill1Anim = useRef(new Animated.Value(0)).current;
+  const pill2Anim = useRef(new Animated.Value(0)).current;
+  const pill3Anim = useRef(new Animated.Value(0)).current;
+  const buttonAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.stagger(90, [
+      Animated.timing(logoAnim, {toValue: 1, duration: 500, useNativeDriver: true}),
+      Animated.timing(titleAnim, {toValue: 1, duration: 400, useNativeDriver: true}),
+      Animated.timing(subtitleAnim, {toValue: 1, duration: 400, useNativeDriver: true}),
+      Animated.timing(pill1Anim, {toValue: 1, duration: 300, useNativeDriver: true}),
+      Animated.timing(pill2Anim, {toValue: 1, duration: 300, useNativeDriver: true}),
+      Animated.timing(pill3Anim, {toValue: 1, duration: 300, useNativeDriver: true}),
+      Animated.timing(buttonAnim, {toValue: 1, duration: 400, useNativeDriver: true}),
+    ]).start();
+  }, [logoAnim, titleAnim, subtitleAnim, pill1Anim, pill2Anim, pill3Anim, buttonAnim]);
+
+  const fadeSlide = (anim: Animated.Value, offsetY = 16) => ({
+    opacity: anim,
+    transform: [
+      {
+        translateY: anim.interpolate({
+          inputRange: [0, 1],
+          outputRange: [offsetY, 0],
+        }),
+      },
+    ],
+  });
 
   const handleStartChat = useCallback(() => {
     const id = createConversation();
@@ -45,45 +78,50 @@ export default function HomeScreen(): React.JSX.Element {
       {/* Main content */}
       <View style={styles.content}>
         {/* Logo */}
-        <View style={styles.logoContainer}>
+        <Animated.View style={[styles.logoContainer, fadeSlide(logoAnim, 24)]}>
           <View style={styles.logoCircle}>
             <Text style={styles.logoLetter}>A</Text>
           </View>
-        </View>
+        </Animated.View>
 
-        <Text style={styles.title}>Alfa AI</Text>
-        <Text style={styles.subtitle}>
+        <Animated.Text style={[styles.title, fadeSlide(titleAnim)]}>
+          Alfa AI
+        </Animated.Text>
+
+        <Animated.Text style={[styles.subtitle, fadeSlide(subtitleAnim)]}>
           Seu assistente de IA local,{'\n'}privado e sem internet.
-        </Text>
+        </Animated.Text>
 
         {/* Feature pills */}
         <View style={styles.features}>
-          <View style={styles.featurePill}>
+          <Animated.View style={[styles.featurePill, fadeSlide(pill1Anim)]}>
             <Text style={styles.featureIcon}>&#128274;</Text>
             <Text style={styles.featureText}>100% Privado</Text>
-          </View>
-          <View style={styles.featurePill}>
+          </Animated.View>
+          <Animated.View style={[styles.featurePill, fadeSlide(pill2Anim)]}>
             <Text style={styles.featureIcon}>&#9889;</Text>
             <Text style={styles.featureText}>Offline</Text>
-          </View>
-          <View style={styles.featurePill}>
+          </Animated.View>
+          <Animated.View style={[styles.featurePill, fadeSlide(pill3Anim)]}>
             <Text style={styles.featureIcon}>&#129504;</Text>
             <Text style={styles.featureText}>IA Local</Text>
-          </View>
+          </Animated.View>
         </View>
 
         {/* CTA Button */}
-        <TouchableOpacity
-          style={styles.startButton}
-          onPress={handleStartChat}
-          activeOpacity={0.85}>
-          <Text style={styles.startButtonText}>Iniciar Conversa</Text>
-        </TouchableOpacity>
+        <Animated.View style={fadeSlide(buttonAnim)}>
+          <TouchableOpacity
+            style={styles.startButton}
+            onPress={handleStartChat}
+            activeOpacity={0.85}>
+            <Text style={styles.startButtonText}>Iniciar Conversa</Text>
+          </TouchableOpacity>
+        </Animated.View>
 
-        <Text style={styles.disclaimer}>
+        <Animated.Text style={[styles.disclaimer, fadeSlide(buttonAnim)]}>
           O modelo precisa estar instalado para usar a IA.{'\n'}
           Acesse Configuracoes para instalar.
-        </Text>
+        </Animated.Text>
       </View>
     </View>
   );
@@ -126,9 +164,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     shadowColor: colors.primary,
     shadowOffset: {width: 0, height: 4},
-    shadowOpacity: 0.3,
-    shadowRadius: 12,
-    elevation: 8,
+    shadowOpacity: 0.4,
+    shadowRadius: 16,
+    elevation: 10,
   },
   logoLetter: {
     color: '#FFFFFF',
@@ -183,6 +221,11 @@ const styles = StyleSheet.create({
     marginBottom: spacing.lg,
     minWidth: 200,
     alignItems: 'center',
+    shadowColor: colors.primary,
+    shadowOffset: {width: 0, height: 4},
+    shadowOpacity: 0.35,
+    shadowRadius: 10,
+    elevation: 6,
   },
   startButtonText: {
     color: '#FFFFFF',

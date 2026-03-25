@@ -3,6 +3,7 @@ import {View, Text, StyleSheet} from 'react-native';
 import {Message} from '../types';
 import {colors, spacing, fonts, radius} from '../theme';
 import {formatDate} from '../utils/helpers';
+import TypingIndicator from './TypingIndicator';
 
 interface ChatBubbleProps {
   message: Message;
@@ -11,6 +12,7 @@ interface ChatBubbleProps {
 export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
   const isUser = message.role === 'user';
   const isError = message.error === true;
+  const isTyping = !isUser && message.content === '' && !isError;
 
   return (
     <View style={[styles.row, isUser ? styles.rowUser : styles.rowAssistant]}>
@@ -25,15 +27,18 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
             <Text style={styles.roleTagText}>Alfa AI</Text>
           </View>
         )}
-        <Text
-          selectable
-          style={[
-            styles.messageText,
-            isError && styles.messageTextError,
-          ]}>
-          {message.content}
-        </Text>
-        <Text style={styles.timestamp}>{formatDate(message.timestamp)}</Text>
+        {isTyping ? (
+          <TypingIndicator />
+        ) : (
+          <Text
+            selectable
+            style={[styles.messageText, isError && styles.messageTextError]}>
+            {message.content}
+          </Text>
+        )}
+        {!isTyping && (
+          <Text style={styles.timestamp}>{formatDate(message.timestamp)}</Text>
+        )}
       </View>
     </View>
   );
@@ -60,16 +65,19 @@ const styles = StyleSheet.create({
   bubbleUser: {
     backgroundColor: colors.userBubble,
     borderBottomRightRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: colors.userBubbleBorder,
   },
   bubbleAssistant: {
     backgroundColor: colors.aiBubble,
     borderBottomLeftRadius: radius.sm,
-    borderWidth: 1,
-    borderColor: colors.border,
+    borderLeftWidth: 3,
+    borderLeftColor: colors.primary,
   },
   bubbleError: {
-    borderColor: colors.danger,
+    borderLeftColor: colors.danger,
     borderWidth: 1,
+    borderColor: colors.danger,
   },
   roleTag: {
     marginBottom: spacing.xs,

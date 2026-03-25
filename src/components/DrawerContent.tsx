@@ -1,11 +1,11 @@
-import React, {useCallback} from 'react';
+import React, {useCallback, useMemo} from 'react';
 import {
   View,
   Text,
   TouchableOpacity,
-  FlatList,
+  SectionList,
   StyleSheet,
-  ListRenderItem,
+  SectionListRenderItem,
 } from 'react-native';
 import {DrawerContentComponentProps} from '@react-navigation/drawer';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
@@ -20,6 +20,32 @@ import {RootStackParamList} from '../navigation/AppNavigator';
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
+interface Section {
+  title: string;
+  data: Conversation[];
+}
+
+function getSectionTitle(timestamp: number): string {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfYesterday = new Date(startOfToday.getTime() - 86400000);
+  const startOfWeek = new Date(startOfToday.getTime() - 7 * 86400000);
+
+  if (date >= startOfToday) {
+    return 'Hoje';
+  }
+  if (date >= startOfYesterday) {
+    return 'Ontem';
+  }
+  if (date >= startOfWeek) {
+    return 'Esta semana';
+  }
+  return 'Mais antigo';
+}
+
+const SECTION_ORDER = ['Hoje', 'Ontem', 'Esta semana', 'Mais antigo'];
+
 export default function DrawerContent(
   _props: DrawerContentComponentProps,
 ): React.JSX.Element {
@@ -27,6 +53,20 @@ export default function DrawerContent(
   const navigation = useNavigation<NavigationProp>();
   const {state, createConversation, setCurrentConversation, deleteConversation} =
     useChatStore();
+
+  const sections: Section[] = useMemo(() => {
+    const groups: Record<string, Conversation[]> = {};
+    for (const conv of state.conversations) {
+      const key = getSectionTitle(conv.updatedAt);
+      if (!groups[key]) {
+        groups[key] = [];
+      }
+      groups[key].push(conv);
+    }
+    return SECTION_ORDER
+      .filter(key => groups[key]?.length > 0)
+      .map(key => ({title: key, data: groups[key]}));
+  }, [state.conversations]);
 
   const handleNewConversation = useCallback(() => {
     const id = createConversation();
@@ -53,7 +93,7 @@ export default function DrawerContent(
     navigation.navigate('Settings');
   }, [navigation]);
 
-  const renderItem: ListRenderItem<Conversation> = useCallback(
+  const renderItem: SectionListRenderItem<Conversation, Section> = useCallback(
     ({item}) => {
       const isActive = item.id === state.currentConversationId;
       return (
@@ -61,8 +101,9 @@ export default function DrawerContent(
           style={[styles.conversationItem, isActive && styles.conversationItemActive]}
           onPress={() => handleSelectConversation(item)}
           activeOpacity={0.7}>
+          {isActive && <View style={styles.activeIndicator} />}
           <View style={styles.conversationContent}>
-            <Text style={styles.conversationTitle} numberOfLines={1}>
+            <Text style={[styles.conversationTitle, isActive && styles.conversationTitleActive]} numberOfLines={1}>
               {truncateText(item.title, 35)}
             </Text>
             <Text style={styles.conversationDate}>
@@ -79,6 +120,15 @@ export default function DrawerContent(
       );
     },
     [state.currentConversationId, handleSelectConversation, handleDeleteConversation],
+  );
+
+  const renderSectionHeader = useCallback(
+    ({section}: {section: Section}) => (
+      <View style={styles.sectionHeader}>
+        <Text style={styles.sectionHeaderText}>{section.title}</Text>
+      </View>
+    ),
+    [],
   );
 
   const keyExtractor = useCallback((item: Conversation) => item.id, []);
@@ -104,7 +154,6 @@ export default function DrawerContent(
 
       {/* Conversations List */}
       <View style={styles.listContainer}>
-        <Text style={styles.sectionLabel}>CONVERSAS</Text>
         {state.conversations.length === 0 ? (
           <View style={styles.emptyState}>
             <Text style={styles.emptyStateText}>
@@ -112,12 +161,14 @@ export default function DrawerContent(
             </Text>
           </View>
         ) : (
-          <FlatList
-            data={state.conversations}
+          <SectionList
+            sections={sections}
             renderItem={renderItem}
+            renderSectionHeader={renderSectionHeader}
             keyExtractor={keyExtractor}
             showsVerticalScrollIndicator={false}
             contentContainerStyle={styles.listContent}
+            stickySectionHeadersEnabled={false}
           />
         )}
       </View>
@@ -194,18 +245,23 @@ const styles = StyleSheet.create({
   },
   listContainer: {
     flex: 1,
-    paddingTop: spacing.md,
-  },
-  sectionLabel: {
-    color: colors.textMuted,
-    fontSize: fonts.sizes.xs,
-    fontWeight: '600',
-    letterSpacing: 1,
-    paddingHorizontal: spacing.lg,
-    marginBottom: spacing.sm,
+    paddingTop: spacing.xs,
   },
   listContent: {
     paddingHorizontal: spacing.sm,
+    paddingBottom: spacing.md,
+  },
+  sectionHeader: {
+    paddingHorizontal: spacing.md,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.xs,
+  },
+  sectionHeaderText: {
+    color: colors.textMuted,
+    fontSize: fonts.sizes.xs,
+    fontWeight: '600',
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
   },
   conversationItem: {
     flexDirection: 'row',
@@ -214,9 +270,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
     borderRadius: radius.md,
     marginBottom: 2,
+    overflow: 'hidden',
   },
   conversationItemActive: {
     backgroundColor: colors.surfaceElevated,
+  },
+  activeIndicator: {
+    position: 'absolute',
+    left: 0,
+    top: 6,
+    bottom: 6,
+    width: 3,
+    borderRadius: radius.full,
+    backgroundColor: colors.primary,
   },
   conversationContent: {
     flex: 1,
@@ -226,6 +292,10 @@ const styles = StyleSheet.create({
     fontSize: fonts.sizes.sm,
     fontWeight: '500',
     marginBottom: 2,
+  },
+  conversationTitleActive: {
+    color: colors.text,
+    fontWeight: '600',
   },
   conversationDate: {
     color: colors.textMuted,
