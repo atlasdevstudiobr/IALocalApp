@@ -31,8 +31,32 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Decode keystore from base64
-        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > android/app/release.keystore
+      - name: Prepare signing config
+        run: |
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ] && \
+             [ -n "${{ secrets.KEYSTORE_PASSWORD }}" ] && \
+             [ -n "${{ secrets.KEY_ALIAS }}" ] && \
+             [ -n "${{ secrets.KEY_PASSWORD }}" ]; then
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > android/app/release.keystore
+            echo "KEYSTORE_PATH=release.keystore" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}" >> "$GITHUB_ENV"
+          else
+            keytool -genkeypair -v \
+              -keystore android/app/debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "KEYSTORE_PATH=debug.keystore" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASSWORD=android" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=androiddebugkey" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=android" >> "$GITHUB_ENV"
+          fi
 
       - name: Download Gradle Wrapper JAR
         run: |
@@ -46,10 +70,10 @@ jobs:
         working-directory: android
         run: ./gradlew assembleRelease --no-daemon
         env:
-          KEYSTORE_PATH: release.keystore
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEYSTORE_PATH: ${{ env.KEYSTORE_PATH }}
+          KEYSTORE_PASSWORD: ${{ env.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ env.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ env.KEY_PASSWORD }}
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -60,4 +84,4 @@ jobs:
 
       - name: Cleanup keystore
         if: always()
-        run: rm -f android/app/release.keystore
+        run: rm -f android/app/release.keystore android/app/debug.keystore
