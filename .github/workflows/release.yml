@@ -34,6 +34,11 @@ jobs:
       - name: Decode keystore from base64
         run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > android/app/release.keystore
 
+      - name: Download Gradle Wrapper JAR
+        run: |
+          curl -sSL -o android/gradle/wrapper/gradle-wrapper.jar \
+            "https://github.com/gradle/gradle/raw/v8.6.0/gradle/wrapper/gradle-wrapper.jar"
+
       - name: Make gradlew executable
         run: chmod +x android/gradlew
 
