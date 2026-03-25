@@ -18,6 +18,7 @@ const STORAGE_KEY = '@alfaai_model_download_state';
 const MODEL_DIR_NAME = 'models';
 
 type DownloadOutcome = 'success' | 'error' | 'cancelled';
+const MODEL_STATUS_VALUES: ModelStatus[] = ['not_downloaded', 'downloading', 'ready', 'error'];
 
 export interface ModelDownloadState {
   name: string;
@@ -78,7 +79,45 @@ function parseStoredState(raw: string | null): Partial<ModelDownloadState> {
     if (!parsed || typeof parsed !== 'object') {
       return {};
     }
-    return parsed as Partial<ModelDownloadState>;
+    const state = parsed as Partial<ModelDownloadState>;
+    const normalized: Partial<ModelDownloadState> = {};
+
+    if (typeof state.name === 'string' && state.name.trim()) {
+      normalized.name = state.name;
+    }
+
+    if (
+      typeof state.status === 'string' &&
+      MODEL_STATUS_VALUES.includes(state.status as ModelStatus)
+    ) {
+      normalized.status = state.status as ModelStatus;
+    }
+
+    if (typeof state.downloadUrl === 'string' && state.downloadUrl.trim()) {
+      normalized.downloadUrl = state.downloadUrl;
+    }
+
+    if (typeof state.filePath === 'string' && state.filePath.trim()) {
+      normalized.filePath = state.filePath;
+    }
+
+    if (typeof state.downloadProgress === 'number' && Number.isFinite(state.downloadProgress)) {
+      normalized.downloadProgress = Math.max(0, Math.min(100, state.downloadProgress));
+    }
+
+    if (typeof state.downloadedBytes === 'number' && Number.isFinite(state.downloadedBytes)) {
+      normalized.downloadedBytes = Math.max(0, state.downloadedBytes);
+    }
+
+    if (typeof state.totalBytes === 'number' && Number.isFinite(state.totalBytes)) {
+      normalized.totalBytes = Math.max(0, state.totalBytes);
+    }
+
+    if (typeof state.errorMessage === 'string' && state.errorMessage.trim()) {
+      normalized.errorMessage = state.errorMessage;
+    }
+
+    return normalized;
   } catch {
     return {};
   }
@@ -121,26 +160,30 @@ async function readFileSize(path: string): Promise<number> {
   return Number(stats.size) || 0;
 }
 
-async function validateModelFile(path: string): Promise<{valid: boolean; size: number}> {
+async function validateModelFile(
+  path: string,
+): Promise<{exists: boolean; valid: boolean; size: number}> {
   const exists = await ReactNativeBlobUtil.fs.exists(path);
   if (!exists) {
-    return {valid: false, size: 0};
+    return {exists: false, valid: false, size: 0};
   }
 
   const size = await readFileSize(path);
   if (size < LOCAL_MODEL_MIN_VALID_SIZE_BYTES) {
-    return {valid: false, size};
+    return {exists: true, valid: false, size};
   }
 
-  return {valid: true, size};
+  return {exists: true, valid: true, size};
 }
 
-function buildDownloadedState(size: number): ModelDownloadState {
+function buildDownloadedState(size: number, baseState?: ModelDownloadState): ModelDownloadState {
+  const fallback = buildDefaultState();
+
   return {
-    name: LOCAL_MODEL_DISPLAY_NAME,
+    name: baseState?.name || fallback.name,
     status: 'ready',
-    downloadUrl: LOCAL_MODEL_DOWNLOAD_URL,
-    filePath: getModelFilePath(),
+    downloadUrl: baseState?.downloadUrl || fallback.downloadUrl,
+    filePath: baseState?.filePath || fallback.filePath,
     downloadProgress: 100,
     downloadedBytes: size,
     totalBytes: Math.max(size, LOCAL_MODEL_ESTIMATED_SIZE_BYTES),
@@ -152,42 +195,59 @@ export async function loadModelDownloadState(): Promise<ModelDownloadState> {
     await ensureModelDirectory();
     const raw = await AsyncStorage.getItem(STORAGE_KEY);
     const stored = parseStoredState(raw);
+    const hasStoredData = Boolean(raw);
 
     const state: ModelDownloadState = {
       ...buildDefaultState(),
       ...stored,
-      filePath: getModelFilePath(),
     };
+
+    if (!state.filePath) {
+      state.filePath = getModelFilePath();
+    }
+
+    if (hasStoredData) {
+      logInfo(TAG, 'Caminho do modelo restaurado do estado salvo', `Path: ${state.filePath}`);
+    }
 
     const validation = await validateModelFile(state.filePath);
 
     if (validation.valid) {
-      const downloadedState = {
-        ...state,
-        status: 'ready' as const,
-        downloadProgress: 100,
-        downloadedBytes: validation.size,
+      const downloadedState: ModelDownloadState = {
+        ...buildDownloadedState(validation.size, state),
         totalBytes: Math.max(validation.size, state.totalBytes || 0),
         errorMessage: undefined,
       };
       await persistModelState(downloadedState);
       logInfo(
         TAG,
-        'Modelo local detectado no armazenamento',
-        `Path: ${downloadedState.filePath}\nTamanho: ${validation.size} bytes`,
+        'Modelo detectado automaticamente',
+        `Nome: ${downloadedState.name}\nPath: ${downloadedState.filePath}\nTamanho: ${validation.size} bytes`,
       );
       return downloadedState;
     }
 
-    if (validation.size > 0) {
+    if (!validation.exists && (state.status === 'ready' || state.downloadedBytes > 0)) {
       logWarn(
         TAG,
-        'Arquivo de modelo encontrado, mas invalido',
+        'Arquivo de modelo ausente',
+        `Path salvo: ${state.filePath}\nStatus salvo: ${state.status}`,
+      );
+    }
+
+    if (validation.exists && validation.size > 0) {
+      logWarn(
+        TAG,
+        'Arquivo de modelo corrompido ou invalido',
         `Path: ${state.filePath}\nTamanho detectado: ${validation.size} bytes`,
       );
     }
 
-    if (state.status === 'downloading') {
+    if (
+      state.status === 'downloading' ||
+      state.status === 'ready' ||
+      (validation.exists && !validation.valid)
+    ) {
       state.status = 'not_downloaded';
       state.downloadProgress = 0;
       state.downloadedBytes = 0;
@@ -225,12 +285,16 @@ async function finalizeState(
     const size = await readFileSize(baseState.filePath);
     const doneState = {
       ...baseState,
-      ...buildDownloadedState(size),
+      ...buildDownloadedState(size, baseState),
       errorMessage: undefined,
     };
 
     await persistModelState(doneState);
-    logInfo(TAG, 'Download do modelo concluido com sucesso', `Path: ${doneState.filePath}`);
+    logInfo(
+      TAG,
+      'Download do modelo finalizado',
+      `Nome: ${doneState.name}\nPath: ${doneState.filePath}\nTamanho: ${size} bytes`,
+    );
     return doneState;
   }
 

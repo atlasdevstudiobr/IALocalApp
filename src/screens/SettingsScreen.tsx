@@ -12,6 +12,7 @@ import {useNavigation, DrawerActions} from '@react-navigation/native';
 import ModelStatusCard from '../components/ModelStatusCard';
 import LogsViewer from '../components/LogsViewer';
 import {colors, spacing, fonts, radius} from '../theme';
+import {LOCAL_MODEL_DISPLAY_NAME} from '../config/modelConfig';
 import {
   ModelDownloadState,
   cancelModelDownload,
@@ -122,6 +123,8 @@ export default function SettingsScreen(): React.JSX.Element {
         {/* Model section */}
         <Text style={styles.sectionTitle}>Modelo de IA</Text>
         <ModelStatusCard
+          modelName={modelState?.name ?? LOCAL_MODEL_DISPLAY_NAME}
+          filePath={modelState?.filePath}
           status={modelState?.status ?? 'not_downloaded'}
           progress={modelState?.downloadProgress ?? 0}
           downloadedBytes={modelState?.downloadedBytes ?? 0}

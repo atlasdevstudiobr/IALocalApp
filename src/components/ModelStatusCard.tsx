@@ -5,6 +5,8 @@ import {colors, spacing, fonts, radius} from '../theme';
 import {formatBytes} from '../utils/helpers';
 
 interface ModelStatusCardProps {
+  modelName?: string;
+  filePath?: string;
   status: ModelStatus;
   progress: number;
   downloadedBytes: number;
@@ -14,6 +16,8 @@ interface ModelStatusCardProps {
 }
 
 export default function ModelStatusCard({
+  modelName,
+  filePath,
   status,
   progress,
   downloadedBytes,
@@ -29,7 +33,7 @@ export default function ModelStatusCard({
     status === 'downloading'
       ? 'Baixando'
       : status === 'ready'
-      ? 'Baixado'
+      ? 'Instalado'
       : status === 'error'
       ? 'Erro no download'
       : 'Nao instalado';
@@ -47,7 +51,7 @@ export default function ModelStatusCard({
     status === 'downloading'
       ? 'Cancelar download'
       : status === 'ready'
-      ? 'Modelo baixado'
+      ? 'Modelo instalado'
       : status === 'error'
       ? 'Tentar novamente'
       : 'Baixar modelo';
@@ -60,7 +64,7 @@ export default function ModelStatusCard({
   const infoText = isError
     ? errorMessage || 'Nao foi possivel baixar o modelo. Tente novamente.'
     : isReady
-    ? `Modelo salvo localmente em: ${formatBytes(downloadedBytes)}`
+    ? `Modelo instalado com sucesso (${formatBytes(downloadedBytes)}).`
     : 'O modelo de IA local precisa ser baixado antes de usar o app offline. Necessario ~2 GB de espaco livre.';
 
   return (
@@ -70,7 +74,7 @@ export default function ModelStatusCard({
           <Text style={styles.modelIcon}>&#129302;</Text>
         </View>
         <View style={styles.modelInfo}>
-          <Text style={styles.modelName}>Qwen2.5-3B-Instruct Q4_K_M</Text>
+          <Text style={styles.modelName}>{modelName || 'Qwen2.5-3B-Instruct Q4_K_M'}</Text>
           <Text style={styles.modelSize}>Tamanho estimado: ~2.0 GB</Text>
         </View>
       </View>
@@ -94,6 +98,7 @@ export default function ModelStatusCard({
 
       {/* Info text */}
       <Text style={styles.infoText}>{infoText}</Text>
+      {isReady && filePath ? <Text style={styles.pathText}>{filePath}</Text> : null}
 
       {/* Action button */}
       <TouchableOpacity
@@ -211,6 +216,11 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     fontSize: fonts.sizes.xs,
     lineHeight: 18,
+    marginBottom: spacing.sm,
+  },
+  pathText: {
+    color: colors.textMuted,
+    fontSize: fonts.sizes.xs,
     marginBottom: spacing.lg,
   },
   downloadButton: {
