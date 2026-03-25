@@ -1,5 +1,12 @@
 import {Message} from '../types';
-import {logInfo, logWarn} from './logService';
+import {logError, logInfo, logWarn} from './logService';
+import {
+  ensureRuntimeReady,
+  getRuntimeState,
+  inferWithLocalRuntime,
+  releaseRuntime,
+  RuntimeStatus,
+} from './localRuntimeService';
 
 const TAG = 'AIService';
 
@@ -10,16 +17,9 @@ const STUB_RESPONSE =
   '\u2699\uFE0F Modelo local ainda nao instalado. Acesse Configuracoes para instalar o modelo Qwen2.5-3B.';
 
 /**
- * Flag to simulate whether a model is loaded.
- * When llama.cpp is integrated, replace this with actual model state.
- */
-let isModelLoaded = false;
-
-/**
  * Generates a response from the AI model.
  *
- * Currently returns a stub response indicating the model is not yet installed.
- * This function is structured to be replaced with llama.cpp/ggml integration.
+ * Usa runtime local quando disponivel e faz fallback para stub em caso de falha.
  *
  * @param messages - The conversation history to send to the model
  * @returns Promise resolving to the assistant's response text
@@ -32,57 +32,66 @@ export async function generateResponse(messages: Message[]): Promise<string> {
     `Last message role: ${lastMessage?.role ?? 'none'}`,
   );
 
-  if (!isModelLoaded) {
-    logWarn(TAG, 'Model not loaded, returning stub response');
-
-    // Simulate network/processing delay
-    await new Promise<void>(resolve => setTimeout(resolve, 500));
-
+  const runtimeReady = await ensureRuntimeReady();
+  if (!runtimeReady) {
+    const state = getRuntimeState();
+    logWarn(
+      TAG,
+      'Runtime indisponivel, retornando fallback stub',
+      `Status runtime: ${state.status}\nMotivo: ${state.errorMessage ?? 'modelo nao carregado'}`,
+    );
     return STUB_RESPONSE;
   }
 
-  // -------------------------------------------------------------------------
-  // TODO: Replace this block with llama.cpp integration
-  //
-  // Example future integration:
-  //
-  //   const context = await LlamaContext.create({
-  //     model: modelFilePath,
-  //     n_ctx: 2048,
-  //   });
-  //
-  //   const prompt = formatMessagesAsPrompt(messages);
-  //   const result = await context.completion({ prompt, n_predict: 512 });
-  //   return result.text;
-  //
-  // -------------------------------------------------------------------------
-
-  return STUB_RESPONSE;
+  try {
+    const response = await inferWithLocalRuntime(messages);
+    if (!response) {
+      logWarn(TAG, 'Inferencia vazia, retornando fallback stub');
+      return STUB_RESPONSE;
+    }
+    return response;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logError(TAG, 'Falha na inferencia local, retornando fallback stub', message);
+    return STUB_RESPONSE;
+  }
 }
 
 /**
  * Checks whether the AI model is currently loaded and ready.
  */
 export function isAIReady(): boolean {
-  return isModelLoaded;
+  return getRuntimeState().status === 'ready';
 }
 
 /**
- * Marks the model as loaded (for future use when model loading is implemented).
+ * Mantido por compatibilidade com chamadas antigas.
  */
 export function setModelLoaded(loaded: boolean): void {
-  isModelLoaded = loaded;
-  logInfo(TAG, `Model loaded state set to: ${loaded}`);
+  if (loaded) {
+    void ensureRuntimeReady();
+  } else {
+    void releaseRuntime();
+  }
+  logInfo(TAG, `setModelLoaded called (compat): ${loaded}`);
+}
+
+export function getAIRuntimeStatus(): RuntimeStatus {
+  return getRuntimeState().status;
 }
 
 /**
  * Returns model info for display purposes.
  */
 export function getModelInfo() {
+  const runtime = getRuntimeState();
   return {
     name: 'Qwen2.5-3B-Instruct-Q4_K_M',
     displayName: 'Qwen2.5-3B-Instruct Q4_K_M',
     sizeGB: 2.0,
-    isLoaded: isModelLoaded,
+    isLoaded: runtime.status === 'ready',
+    runtimeStatus: runtime.status,
+    runtimeEngine: runtime.engine,
+    runtimeError: runtime.errorMessage,
   };
 }
