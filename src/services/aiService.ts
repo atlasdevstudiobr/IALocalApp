@@ -1,4 +1,4 @@
-import {Message} from '../types';
+import {Message, MessageSource, SearchDecision, WebValidationStatus} from '../types';
 import * as LogService from './logService';
 import {loadModelDownloadState} from './modelDownloadService';
 import {
@@ -10,6 +10,9 @@ import {
   RuntimeStatus,
 } from './localRuntimeService';
 import {loadLocalSafetyDisabled} from './safetySettingsService';
+import {classifySearchDecision} from './searchDecisionService';
+import {searchWeb} from './webSearchService';
+import {buildPromptAugmentation, composeAnswer} from './answerComposerService';
 
 const TAG = 'AIService';
 
@@ -56,11 +59,18 @@ const ASSISTANT_ROLE_LINE_PATTERN = /^(assistente|assistant)\s*:\s*/i;
 const INTERNAL_PERSONA_PATTERN = /(?:voce|você)\s+e\s+o\s+alfa\s+ai/i;
 const TECHNICAL_LEAK_LINE_PATTERN =
   /\b(n_predict|stopped_limit|tokens_predicted|context_full|prompt chars|last user chars|contexto usado|engine:\s*llama\.rn)\b/i;
-const WARMUP_COOLDOWN_MS = 2 * 60 * 1000;
+const WARMUP_COOLDOWN_MS = 8 * 60 * 1000;
 let runtimeBindingsInitialized = false;
 let warmupRuntimePromise: Promise<void> | null = null;
 let lastWarmupAt = 0;
 export type ResponseStreamCallback = (partialResponse: string) => void;
+
+export interface GeneratedResponsePackage {
+  text: string;
+  sources: MessageSource[];
+  searchDecision: SearchDecision;
+  webValidationStatus: WebValidationStatus;
+}
 
 function logInfo(tag: string, message: string, details?: string): void {
   try {
@@ -498,23 +508,45 @@ export async function generateResponseStream(
   messages: Message[],
   onPartial?: ResponseStreamCallback,
 ): Promise<string> {
+  const responsePackage = await generateResponsePackageStream(messages, onPartial);
+  return responsePackage.text;
+}
+
+export async function generateResponsePackageStream(
+  messages: Message[],
+  onPartial?: ResponseStreamCallback,
+): Promise<GeneratedResponsePackage> {
   ensureRuntimeBindings();
   const localSafetyDisabled = await loadLocalSafetyDisabled();
   const lastMessage = messages[messages.length - 1];
+  const decisionResult = classifySearchDecision(messages);
   logInfo(
     TAG,
-    `Entrada no AIService.generateResponse com ${messages.length} mensagem(ns)`,
-    `Last message role: ${lastMessage?.role ?? 'none'}\nlocalSafetyDisabled=${localSafetyDisabled}`,
+    `Entrada no AIService.generateResponsePackage com ${messages.length} mensagem(ns)`,
+    `Last message role: ${lastMessage?.role ?? 'none'}\nlocalSafetyDisabled=${localSafetyDisabled}\nsearchDecision=${decisionResult.decision}`,
   );
 
+  const runtimeReadyPromise = ensureRuntimeReady();
+  const webSearchPromise =
+    decisionResult.decision === 'local_plus_web' && decisionResult.query
+      ? searchWeb(decisionResult.query)
+      : Promise.resolve(undefined);
+
   let runtimeReady = false;
+  let webResult = await webSearchPromise;
   try {
     logInfo(TAG, 'Checagem de runtime/modelo iniciada');
-    runtimeReady = await ensureRuntimeReady();
+    runtimeReady = await runtimeReadyPromise;
     logInfo(TAG, 'Checagem de runtime/modelo concluida', `Runtime pronto: ${runtimeReady}`);
   } catch (error) {
     logError(TAG, 'Erro ao checar/carregar runtime', toErrorDetails(error));
-    return RUNTIME_FAILURE_FALLBACK;
+    return {
+      text: RUNTIME_FAILURE_FALLBACK,
+      sources: [],
+      searchDecision: decisionResult.decision,
+      webValidationStatus:
+        decisionResult.decision === 'local_plus_web' ? 'failed' : 'not_needed',
+    };
   }
 
   if (!runtimeReady) {
@@ -526,61 +558,137 @@ export async function generateResponseStream(
       state.status === 'not_loaded' && !state.modelPath && !state.errorMessage;
     if (modelUnavailable) {
       logWarn(TAG, 'Runtime indisponivel por modelo nao carregado, fallback de modelo', detail);
-      return STUB_RESPONSE;
+      return {
+        text: STUB_RESPONSE,
+        sources: [],
+        searchDecision: decisionResult.decision,
+        webValidationStatus:
+          decisionResult.decision === 'local_plus_web' ? 'failed' : 'not_needed',
+      };
     }
     logWarn(TAG, 'Runtime indisponivel, fallback de falha de runtime', detail);
-    return RUNTIME_FAILURE_FALLBACK;
+    return {
+      text: RUNTIME_FAILURE_FALLBACK,
+      sources: [],
+      searchDecision: decisionResult.decision,
+      webValidationStatus:
+        decisionResult.decision === 'local_plus_web' ? 'failed' : 'not_needed',
+    };
   }
 
   try {
+    const augmentation = buildPromptAugmentation(decisionResult.decision, webResult);
     logInfo(TAG, 'Inicio da inferencia via runtime local');
-    const response = await inferWithLocalRuntime(messages, onPartial
-      ? (rawPartial: string) => {
-          const partialResponse = localSafetyDisabled
-            ? rawPartial
-            : buildPartialResponse(rawPartial);
-          if (!partialResponse.trim()) {
-            return;
+    const response = await inferWithLocalRuntime(
+      messages,
+      onPartial
+        ? (rawPartial: string) => {
+            const partialResponse = localSafetyDisabled
+              ? rawPartial
+              : buildPartialResponse(rawPartial);
+            if (!partialResponse.trim()) {
+              return;
+            }
+            onPartial(partialResponse);
           }
-          onPartial(partialResponse);
-        }
-      : undefined);
+        : undefined,
+      {
+        externalContext: augmentation.externalContext,
+        policyInstruction: augmentation.policyInstruction,
+      },
+    );
     if (typeof response !== 'string') {
       logWarn(
         TAG,
         'Inferencia retornou valor invalido (nao string), aplicando fallback',
         `Tipo retornado: ${typeof response}`,
       );
-      return RUNTIME_FAILURE_FALLBACK;
+      return {
+        text: RUNTIME_FAILURE_FALLBACK,
+        sources: [],
+        searchDecision: decisionResult.decision,
+        webValidationStatus:
+          decisionResult.decision === 'local_plus_web' ? 'failed' : 'not_needed',
+      };
     }
+    const baseResponse = localSafetyDisabled
+      ? ensureNaturalResponseEnding(response.trim())
+      : buildFinalResponse(response, getLastUserContent(messages));
     if (localSafetyDisabled) {
-      const rawResponse = ensureNaturalResponseEnding(response.trim());
-      if (!rawResponse) {
+      if (!baseResponse) {
         logWarn(TAG, 'Resposta vazia com modo de teste ativo, aplicando fallback de runtime');
-        return RUNTIME_FAILURE_FALLBACK;
+        return {
+          text: RUNTIME_FAILURE_FALLBACK,
+          sources: [],
+          searchDecision: decisionResult.decision,
+          webValidationStatus:
+            decisionResult.decision === 'local_plus_web' ? 'failed' : 'not_needed',
+        };
       }
       logInfo(
         TAG,
         'Retorno da inferencia recebido com modo de teste ativo',
-        `Tamanho bruto/final: ${rawResponse.length}`,
+        `Tamanho bruto/final: ${baseResponse.length}`,
       );
-      return rawResponse;
+      const composed = composeAnswer({
+        rawAnswer: baseResponse,
+        decision: decisionResult.decision,
+        webResult,
+      });
+      return {
+        text: composed.text,
+        sources: composed.sources,
+        searchDecision: decisionResult.decision,
+        webValidationStatus: composed.webValidationStatus,
+      };
     }
-    const lastUserContent = getLastUserContent(messages);
-    const finalResponse = buildFinalResponse(response, lastUserContent);
-    if (!finalResponse.trim()) {
+    if (!baseResponse.trim()) {
       logWarn(TAG, 'Resposta descartada por sanitizacao/empty output, aplicando fallback seguro');
-      return buildCasualSafetyFallback(lastUserContent);
+      const fallback = buildCasualSafetyFallback(getLastUserContent(messages));
+      const composedFallback = composeAnswer({
+        rawAnswer: fallback,
+        decision: decisionResult.decision,
+        webResult,
+      });
+      return {
+        text: composedFallback.text,
+        sources: composedFallback.sources,
+        searchDecision: decisionResult.decision,
+        webValidationStatus: composedFallback.webValidationStatus,
+      };
     }
+    const composed = composeAnswer({
+      rawAnswer: baseResponse,
+      decision: decisionResult.decision,
+      webResult,
+    });
     logInfo(
       TAG,
       'Retorno da inferencia recebido',
-      `Tamanho bruto: ${response.length}\nTamanho final: ${finalResponse.length}`,
+      `Tamanho bruto: ${response.length}\nTamanho final: ${composed.text.length}\nwebValidation=${composed.webValidationStatus}\nfontes=${composed.sources.length}`,
     );
-    return finalResponse;
+    return {
+      text: composed.text,
+      sources: composed.sources,
+      searchDecision: decisionResult.decision,
+      webValidationStatus: composed.webValidationStatus,
+    };
   } catch (error) {
     logError(TAG, 'Falha na inferencia local, aplicando fallback seguro', toErrorDetails(error));
-    return RUNTIME_FAILURE_FALLBACK;
+    if (!webResult && decisionResult.decision === 'local_plus_web' && decisionResult.query) {
+      webResult = await searchWeb(decisionResult.query);
+    }
+    const fallbackComposed = composeAnswer({
+      rawAnswer: RUNTIME_FAILURE_FALLBACK,
+      decision: decisionResult.decision,
+      webResult,
+    });
+    return {
+      text: fallbackComposed.text,
+      sources: fallbackComposed.sources,
+      searchDecision: decisionResult.decision,
+      webValidationStatus: fallbackComposed.webValidationStatus,
+    };
   }
 }
 

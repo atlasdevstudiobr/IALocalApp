@@ -1,5 +1,14 @@
 import React, {memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
-import {View, Text, StyleSheet, Pressable, Platform, Clipboard} from 'react-native';
+import {
+  View,
+  Text,
+  StyleSheet,
+  Pressable,
+  Platform,
+  Clipboard,
+  ScrollView,
+  Linking,
+} from 'react-native';
 import {Message} from '../types';
 import {colors, spacing, fonts, radius} from '../theme';
 import {formatDate} from '../utils/helpers';
@@ -350,6 +359,7 @@ function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
     typeof message.timestamp === 'number' && Number.isFinite(message.timestamp)
       ? message.timestamp
       : Date.now();
+  const safeSources = Array.isArray(message.sources) ? message.sources.slice(0, 3) : [];
 
   const isUser = safeRole === 'user';
   const isError = message.error === true;
@@ -401,6 +411,12 @@ function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
     }, 1400);
   }, []);
 
+  const handleOpenSource = useCallback((url: string) => {
+    void Linking.openURL(url).catch(() => {
+      // Ignora falha de abertura de link para nao interromper render do chat.
+    });
+  }, []);
+
   useEffect(() => {
     let isMounted = true;
     void loadLocalSafetyDisabled().then(value => {
@@ -434,11 +450,6 @@ function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
           isUser ? styles.bubbleUserSizing : styles.bubbleAssistantSizing,
           isError && styles.bubbleError,
         ]}>
-        {!isUser && (
-          <View style={styles.roleTag}>
-            <Text style={styles.roleTagText}>Alfa AI</Text>
-          </View>
-        )}
         {isTyping ? (
           <TypingIndicator />
         ) : (
@@ -514,11 +525,17 @@ function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
                         </Text>
                       </Pressable>
                     </View>
-                    <Text
-                      selectable
-                      style={[styles.codeText, isError && styles.messageTextError]}>
-                      {block.code}
-                    </Text>
+                    <ScrollView
+                      horizontal
+                      nestedScrollEnabled
+                      showsHorizontalScrollIndicator={false}
+                      contentContainerStyle={styles.codeScrollContent}>
+                      <Text
+                        selectable
+                        style={[styles.codeText, isError && styles.messageTextError]}>
+                        {block.code}
+                      </Text>
+                    </ScrollView>
                   </View>
                 );
               }
@@ -538,6 +555,23 @@ function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
             })}
           </View>
         )}
+        {!isTyping && safeSources.length > 0 && (
+          <View style={styles.sourcesContainer}>
+            <Text style={styles.sourcesTitle}>Fontes:</Text>
+            {safeSources.map((source, index) => (
+              <Pressable
+                key={`${source.url}-${index}`}
+                hitSlop={6}
+                style={styles.sourceRow}
+                onPress={() => handleOpenSource(source.url)}>
+                <Text style={styles.sourceIndex}>{index + 1}.</Text>
+                <Text style={styles.sourceText} numberOfLines={1}>
+                  {source.siteName}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        )}
         {!isTyping && (
           <Text style={styles.timestamp}>{formatDate(safeTimestamp)}</Text>
         )}
@@ -547,12 +581,25 @@ function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
 }
 
 function areEqual(prev: ChatBubbleProps, next: ChatBubbleProps): boolean {
+  const prevSources = prev.message.sources ?? [];
+  const nextSources = next.message.sources ?? [];
+  const sameSources =
+    prevSources.length === nextSources.length &&
+    prevSources.every(
+      (source, index) =>
+        source.url === nextSources[index]?.url &&
+        source.title === nextSources[index]?.title &&
+        source.siteName === nextSources[index]?.siteName,
+    );
   return (
     prev.message.id === next.message.id &&
     prev.message.role === next.message.role &&
     prev.message.content === next.message.content &&
     prev.message.timestamp === next.message.timestamp &&
-    prev.message.error === next.message.error
+    prev.message.error === next.message.error &&
+    prev.message.webValidationStatus === next.message.webValidationStatus &&
+    prev.message.searchDecision === next.message.searchDecision &&
+    sameSources
   );
 }
 
@@ -574,6 +621,7 @@ const styles = StyleSheet.create({
     borderRadius: radius.lg,
     paddingVertical: spacing.md,
     paddingHorizontal: spacing.lg,
+    borderWidth: 1,
   },
   bubbleUserSizing: {
     maxWidth: '84%',
@@ -584,33 +632,20 @@ const styles = StyleSheet.create({
   bubbleUser: {
     backgroundColor: colors.userBubble,
     borderBottomRightRadius: radius.sm,
-    borderWidth: 1,
     borderColor: colors.userBubbleBorder,
   },
   bubbleAssistant: {
     backgroundColor: colors.aiBubble,
     borderBottomLeftRadius: radius.sm,
-    borderLeftWidth: 3,
-    borderLeftColor: colors.primary,
+    borderColor: 'rgba(30, 190, 150, 0.24)',
     shadowColor: '#000000',
-    shadowOpacity: 0.24,
-    shadowRadius: 8,
-    shadowOffset: {width: 0, height: 2},
-    elevation: 2,
+    shadowOpacity: 0.2,
+    shadowRadius: 10,
+    shadowOffset: {width: 0, height: 3},
+    elevation: 3,
   },
   bubbleError: {
-    borderLeftColor: colors.danger,
-    borderWidth: 1,
     borderColor: colors.danger,
-  },
-  roleTag: {
-    marginBottom: spacing.xs,
-  },
-  roleTagText: {
-    color: colors.primary,
-    fontSize: fonts.sizes.xs,
-    fontWeight: '600',
-    letterSpacing: 0.5,
   },
   messageText: {
     color: colors.text,
@@ -751,6 +786,9 @@ const styles = StyleSheet.create({
       default: 'monospace',
     }),
   },
+  codeScrollContent: {
+    paddingRight: spacing.md,
+  },
   inlinePlain: {
     color: colors.text,
   },
@@ -773,6 +811,37 @@ const styles = StyleSheet.create({
   },
   messageTextError: {
     color: colors.danger,
+  },
+  sourcesContainer: {
+    marginTop: spacing.sm,
+    paddingTop: spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+  },
+  sourcesTitle: {
+    color: colors.textMuted,
+    fontSize: fonts.sizes.xs,
+    marginBottom: spacing.xs,
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
+  },
+  sourceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 2,
+    marginBottom: 2,
+  },
+  sourceIndex: {
+    color: colors.textMuted,
+    fontSize: fonts.sizes.sm,
+    marginRight: spacing.xs,
+    width: 14,
+  },
+  sourceText: {
+    flex: 1,
+    color: colors.primary,
+    fontSize: fonts.sizes.sm,
+    lineHeight: 20,
   },
   timestamp: {
     color: colors.textMuted,

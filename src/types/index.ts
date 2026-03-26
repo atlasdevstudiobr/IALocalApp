@@ -1,9 +1,22 @@
+export type SearchDecision = 'local_only' | 'local_plus_web' | 'local_with_uncertainty';
+
+export type WebValidationStatus = 'not_needed' | 'validated' | 'failed';
+
+export interface MessageSource {
+  title: string;
+  url: string;
+  siteName: string;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: number;
   error?: boolean;
+  sources?: MessageSource[];
+  searchDecision?: SearchDecision;
+  webValidationStatus?: WebValidationStatus;
 }
 
 export interface Conversation {

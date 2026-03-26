@@ -15,7 +15,7 @@ import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 
 import {Message} from '../types';
 import {useChatStore} from '../store/chatStore';
-import {generateResponseStream, warmupRuntimeSafely} from '../services/aiService';
+import {generateResponsePackageStream, warmupRuntimeSafely} from '../services/aiService';
 import {logError, logInfo} from '../services/logService';
 import ChatBubble from '../components/ChatBubble';
 import ChatInput from '../components/ChatInput';
@@ -29,8 +29,9 @@ type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
 const TAG = 'ChatScreen';
 const SEND_FALLBACK_MESSAGE = 'Falha ao carregar o runtime local. Veja os logs.';
-const STREAM_UPDATE_INTERVAL_MS = 70;
-const MAX_RUNTIME_MESSAGES = 16;
+const STREAM_UPDATE_INTERVAL_MS = 95;
+const MIN_STREAM_UPDATE_DELTA_CHARS = 14;
+const MAX_RUNTIME_MESSAGES = 12;
 
 function toErrorDetails(error: unknown): string {
   if (error instanceof Error) {
@@ -108,13 +109,19 @@ export default function ChatScreen(): React.JSX.Element {
     let streamTimer: ReturnType<typeof setTimeout> | null = null;
     let pendingStreamText = '';
     let lastStreamPushAt = 0;
+    let lastPushedStreamText = '';
 
     const flushStreamUpdate = () => {
       if (!targetConversationId || !assistantPlaceholderCreated || !pendingStreamText) {
         streamTimer = null;
         return;
       }
-      updateLastMessage(targetConversationId, pendingStreamText);
+      if (pendingStreamText === lastPushedStreamText) {
+        streamTimer = null;
+        return;
+      }
+      updateLastMessage(targetConversationId, pendingStreamText, {touchUpdatedAt: false});
+      lastPushedStreamText = pendingStreamText;
       lastStreamPushAt = Date.now();
       streamTimer = null;
     };
@@ -123,7 +130,18 @@ export default function ChatScreen(): React.JSX.Element {
       pendingStreamText = partialText;
       const now = Date.now();
       const elapsed = now - lastStreamPushAt;
+      const charDelta = pendingStreamText.length - lastPushedStreamText.length;
+      const isFirstVisibleToken = lastPushedStreamText.length === 0 && pendingStreamText.length > 0;
+      const hasMeaningfulDelta = charDelta >= MIN_STREAM_UPDATE_DELTA_CHARS;
       if (elapsed >= STREAM_UPDATE_INTERVAL_MS) {
+        if (streamTimer) {
+          clearTimeout(streamTimer);
+          streamTimer = null;
+        }
+        flushStreamUpdate();
+        return;
+      }
+      if (isFirstVisibleToken || hasMeaningfulDelta) {
         if (streamTimer) {
           clearTimeout(streamTimer);
           streamTimer = null;
@@ -157,32 +175,46 @@ export default function ChatScreen(): React.JSX.Element {
       });
       assistantPlaceholderCreated = true;
 
-      const allMessages = [...runtimeMessagesForInference, {
-        id: 'temp-user',
-        role: 'user' as const,
-        content: trimmed,
-        timestamp: Date.now(),
-      }];
+      const allMessages = [
+        ...runtimeMessagesForInference,
+        {
+          id: 'temp-user',
+          role: 'user' as const,
+          content: trimmed,
+          timestamp: Date.now(),
+        },
+      ];
 
-      const response = await generateResponseStream(allMessages, (partialText: string) => {
-        if (!partialText) {
-          return;
-        }
-        scheduleStreamUpdate(partialText);
-      });
+      const responsePackage = await generateResponsePackageStream(
+        allMessages,
+        (partialText: string) => {
+          if (!partialText) {
+            return;
+          }
+          scheduleStreamUpdate(partialText);
+        },
+      );
       if (streamTimer) {
         clearTimeout(streamTimer);
         streamTimer = null;
       }
       flushStreamUpdate();
 
-      if (!response) {
-        logError(TAG, 'generateResponseStream retornou null/undefined/vazio no ChatScreen');
-        updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, true);
+      if (!responsePackage.text) {
+        logError(TAG, 'generateResponsePackageStream retornou texto vazio no ChatScreen');
+        updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, {
+          error: true,
+          touchUpdatedAt: true,
+        });
         return;
       }
 
-      updateLastMessage(targetConversationId, response);
+      updateLastMessage(targetConversationId, responsePackage.text, {
+        sources: responsePackage.sources,
+        searchDecision: responsePackage.searchDecision,
+        webValidationStatus: responsePackage.webValidationStatus,
+        touchUpdatedAt: true,
+      });
     } catch (error) {
       logError(TAG, 'Catch no fluxo de envio do chat', toErrorDetails(error));
       if (streamTimer) {
@@ -191,7 +223,10 @@ export default function ChatScreen(): React.JSX.Element {
       }
       if (targetConversationId) {
         if (assistantPlaceholderCreated) {
-          updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, true);
+          updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, {
+            error: true,
+            touchUpdatedAt: true,
+          });
         } else {
           addMessage(targetConversationId, {
             role: 'assistant',

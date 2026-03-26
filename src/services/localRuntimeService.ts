@@ -9,21 +9,22 @@ const TAG = 'LocalRuntimeService';
 const EXPLICIT_RUNTIME_ENGINE = 'llama.rn';
 const EXPLICIT_RUNTIME_STRATEGY = 'static-import';
 
-const DEFAULT_CONTEXT_SIZE = 768;
-const DEFAULT_BATCH_SIZE = 96;
-const DEFAULT_UBATCH_SIZE = 48;
+const DEFAULT_CONTEXT_SIZE = 640;
+const DEFAULT_BATCH_SIZE = 80;
+const DEFAULT_UBATCH_SIZE = 40;
 const DEFAULT_THREADS = 4;
 const MIN_THREADS = 2;
 const MAX_THREADS = 6;
-const DEFAULT_PREDICT_TOKENS = 160;
+const DEFAULT_PREDICT_TOKENS = 144;
 const MIN_PREDICT_TOKENS = 56;
 const MAX_PREDICT_TOKENS = 320;
 const MAX_RETRY_PREDICT_TOKENS = 480;
 const MAX_TRUNCATION_RETRIES = 1;
-const MAX_PROMPT_MESSAGES = 8;
-const MAX_PROMPT_CONTEXT_CHARS = 2000;
-const MAX_PROMPT_CHARS = 2800;
-const MAX_PROMPT_MESSAGE_CHARS = 900;
+const MAX_PROMPT_MESSAGES = 6;
+const MAX_PROMPT_CONTEXT_CHARS = 1600;
+const MAX_PROMPT_CHARS = 2200;
+const MAX_PROMPT_MESSAGE_CHARS = 640;
+const MAX_EXTERNAL_CONTEXT_CHARS = 1800;
 const INFERENCE_TEMPERATURE = 0.62;
 const INFERENCE_TOP_P = 0.88;
 const INFERENCE_TOP_K = 40;
@@ -99,6 +100,16 @@ interface PromptBuildResult {
   nPredict: number;
   contextMessagesCount: number;
   lastUserChars: number;
+}
+
+interface PromptBuildOptions {
+  externalContext?: string;
+  policyInstruction?: string;
+}
+
+interface InferenceOptions {
+  externalContext?: string;
+  policyInstruction?: string;
 }
 
 interface ModelDownloadStateSnapshot {
@@ -363,7 +374,7 @@ function resolvePredictTokens(lastUserMessage: string, requestedItemCount: numbe
     return MIN_PREDICT_TOKENS;
   }
   if (chars <= 72 && wordCount <= 14) {
-    return 112;
+    return 104;
   }
   if (chars <= 140 && wordCount <= 28) {
     return DEFAULT_PREDICT_TOKENS;
@@ -397,7 +408,7 @@ function shouldRetryAfterTruncation(
   result: RuntimeInferenceResult,
   requestedPredictTokens: number,
 ): boolean {
-  if (requestedPredictTokens < 220 || result.contextFull) {
+  if (requestedPredictTokens < 260 || result.contextFull) {
     return false;
   }
   const reachedPredictLimit =
@@ -564,13 +575,31 @@ async function loadModelDownloadStateFromLoader(): Promise<ModelDownloadStateSna
   return state;
 }
 
-function buildPrompt(messages: Message[]): PromptBuildResult {
+function normalizeExternalContext(externalContext: string | undefined): string {
+  if (!externalContext) {
+    return '';
+  }
+  const normalized = externalContext.replace(/\r\n/g, '\n').trim();
+  if (!normalized) {
+    return '';
+  }
+  if (normalized.length <= MAX_EXTERNAL_CONTEXT_CHARS) {
+    return normalized;
+  }
+  return `${normalized.slice(0, MAX_EXTERNAL_CONTEXT_CHARS).trim()}...`;
+}
+
+function buildPrompt(messages: Message[], options?: PromptBuildOptions): PromptBuildResult {
   const normalizedMessages = toPromptMessages(messages);
   const recentMessages = selectRecentPromptMessages(normalizedMessages);
   const lastUserMessage =
     getLastUserPromptContent(recentMessages) || getLastUserPromptContent(normalizedMessages);
   const requestedItemCount = extractRequestedItemCount(lastUserMessage.toLowerCase());
   const dynamicInstruction = buildDynamicPromptInstruction(lastUserMessage, requestedItemCount);
+  let externalContextForPrompt = normalizeExternalContext(options?.externalContext);
+  const policyInstruction = typeof options?.policyInstruction === 'string'
+    ? options.policyInstruction.trim()
+    : '';
 
   let promptMessages = [...recentMessages];
   const composePrompt = () => {
@@ -584,6 +613,10 @@ function buildPrompt(messages: Message[]): PromptBuildResult {
     return [
       `Sistema: ${LOCAL_SYSTEM_PROMPT}`,
       dynamicInstruction,
+      policyInstruction ? `Diretriz interna adicional: ${policyInstruction}` : '',
+      externalContextForPrompt
+        ? `Contexto validado externamente (use apenas para fatos mutaveis):\n${externalContextForPrompt}`
+        : '',
       promptBody,
       'Assistente:',
     ]
@@ -594,6 +627,10 @@ function buildPrompt(messages: Message[]): PromptBuildResult {
   let prompt = composePrompt();
   while (prompt.length > MAX_PROMPT_CHARS && promptMessages.length > 1) {
     promptMessages.shift();
+    prompt = composePrompt();
+  }
+  while (prompt.length > MAX_PROMPT_CHARS && externalContextForPrompt.length > 240) {
+    externalContextForPrompt = `${externalContextForPrompt.slice(0, -240).trim()}...`;
     prompt = composePrompt();
   }
 
@@ -882,8 +919,9 @@ export async function ensureRuntimeReady(): Promise<boolean> {
 export async function inferWithLocalRuntime(
   messages: Message[],
   onPartial?: RuntimePartialCallback,
+  options?: InferenceOptions,
 ): Promise<string> {
-  const promptBuild = buildPrompt(messages);
+  const promptBuild = buildPrompt(messages, options);
   if (!runtimeContext) {
     logError(TAG, 'Inferencia solicitada sem runtimeContext');
     throw new Error('Runtime local indisponivel para inferencia');
@@ -892,7 +930,7 @@ export async function inferWithLocalRuntime(
   logInfo(
     TAG,
     'Iniciando inferencia local',
-    `Mensagens: ${messages.length}\nContexto usado: ${promptBuild.contextMessagesCount}\nPrompt chars: ${promptBuild.prompt.length}\nLast user chars: ${promptBuild.lastUserChars}\nn_predict: ${promptBuild.nPredict}\nEngine: ${runtimeState.engine ?? 'desconhecida'}`,
+    `Mensagens: ${messages.length}\nContexto usado: ${promptBuild.contextMessagesCount}\nPrompt chars: ${promptBuild.prompt.length}\nLast user chars: ${promptBuild.lastUserChars}\nn_predict: ${promptBuild.nPredict}\nContexto externo=${options?.externalContext ? 'sim' : 'nao'}\nEngine: ${runtimeState.engine ?? 'desconhecida'}`,
   );
   try {
     const firstResult = await runtimeContext.infer(promptBuild.prompt, promptBuild.nPredict, onPartial);

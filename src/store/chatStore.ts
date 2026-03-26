@@ -7,7 +7,13 @@ import React, {
   useRef,
   ReactNode,
 } from 'react';
-import {Conversation, Message} from '../types';
+import {
+  Conversation,
+  Message,
+  MessageSource,
+  SearchDecision,
+  WebValidationStatus,
+} from '../types';
 import {
   saveConversations,
   loadConversations,
@@ -41,7 +47,16 @@ type ChatAction =
   | {type: 'CREATE_CONVERSATION'; conversation: Conversation}
   | {type: 'SET_CURRENT_CONVERSATION'; id: string | null}
   | {type: 'ADD_MESSAGE'; conversationId: string; message: Message}
-  | {type: 'UPDATE_LAST_MESSAGE'; conversationId: string; content: string; error?: boolean}
+  | {
+      type: 'UPDATE_LAST_MESSAGE';
+      conversationId: string;
+      content: string;
+      error?: boolean;
+      sources?: MessageSource[];
+      searchDecision?: SearchDecision;
+      webValidationStatus?: WebValidationStatus;
+      touchUpdatedAt?: boolean;
+    }
   | {type: 'DELETE_CONVERSATION'; id: string}
   | {type: 'UPDATE_CONVERSATION_TITLE'; id: string; title: string};
 
@@ -106,7 +121,14 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
           return conv;
         }
         const last = messages[messages.length - 1];
-        if (last.content === action.content && last.error === action.error) {
+        const sameSources = areSourcesEqual(last.sources, action.sources);
+        if (
+          last.content === action.content &&
+          last.error === action.error &&
+          sameSources &&
+          last.searchDecision === action.searchDecision &&
+          last.webValidationStatus === action.webValidationStatus
+        ) {
           return conv;
         }
         changed = true;
@@ -114,8 +136,15 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
           ...last,
           content: action.content,
           error: action.error,
+          sources: action.sources,
+          searchDecision: action.searchDecision,
+          webValidationStatus: action.webValidationStatus,
         };
-        return {...conv, messages, updatedAt: Date.now()};
+        return {
+          ...conv,
+          messages,
+          updatedAt: action.touchUpdatedAt === false ? conv.updatedAt : Date.now(),
+        };
       });
       if (!changed) {
         return state;
@@ -161,6 +190,24 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
   }
 }
 
+function areSourcesEqual(a: MessageSource[] | undefined, b: MessageSource[] | undefined): boolean {
+  const left = a ?? [];
+  const right = b ?? [];
+  if (left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (
+      left[index].title !== right[index].title ||
+      left[index].url !== right[index].url ||
+      left[index].siteName !== right[index].siteName
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Initial state
 // ---------------------------------------------------------------------------
@@ -181,7 +228,17 @@ interface ChatContextValue {
   createConversation: () => string | null;
   setCurrentConversation: (id: string | null) => void;
   addMessage: (conversationId: string, message: Omit<Message, 'id' | 'timestamp'>) => Message;
-  updateLastMessage: (conversationId: string, content: string, error?: boolean) => void;
+  updateLastMessage: (
+    conversationId: string,
+    content: string,
+    options?: {
+      error?: boolean;
+      sources?: MessageSource[];
+      searchDecision?: SearchDecision;
+      webValidationStatus?: WebValidationStatus;
+      touchUpdatedAt?: boolean;
+    },
+  ) => void;
   deleteConversation: (id: string) => void;
   setLoading: (value: boolean) => void;
   getCurrentConversation: () => Conversation | undefined;
@@ -236,7 +293,44 @@ function normalizeMessage(raw: Partial<Message> | null | undefined): Message | n
     ? raw.timestamp
     : Date.now();
   const error = raw.error === true ? true : undefined;
-  return {id, role, content, timestamp, error};
+  const validSources = Array.isArray(raw.sources)
+    ? raw.sources
+        .map(source => {
+          if (!source || typeof source !== 'object') {
+            return null;
+          }
+          const title = typeof source.title === 'string' ? source.title.trim() : '';
+          const url = typeof source.url === 'string' ? source.url.trim() : '';
+          const siteName = typeof source.siteName === 'string' ? source.siteName.trim() : '';
+          if (!title || !url || !siteName) {
+            return null;
+          }
+          return {title, url, siteName};
+        })
+        .filter((source): source is MessageSource => source !== null)
+    : undefined;
+  const searchDecision =
+    raw.searchDecision === 'local_only' ||
+    raw.searchDecision === 'local_plus_web' ||
+    raw.searchDecision === 'local_with_uncertainty'
+      ? raw.searchDecision
+      : undefined;
+  const webValidationStatus =
+    raw.webValidationStatus === 'not_needed' ||
+    raw.webValidationStatus === 'validated' ||
+    raw.webValidationStatus === 'failed'
+      ? raw.webValidationStatus
+      : undefined;
+  return {
+    id,
+    role,
+    content,
+    timestamp,
+    error,
+    sources: validSources,
+    searchDecision,
+    webValidationStatus,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +346,7 @@ export function ChatProvider({children}: ChatProviderProps): React.JSX.Element {
   const conversationsPersistTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestConversationsRef = useRef<Conversation[]>([]);
   const lastPersistedCurrentConversationIdRef = useRef<string | null>(null);
+  const pendingPersistAfterStreamingRef = useRef<boolean>(false);
 
   // Load persisted data on mount
   useEffect(() => {
@@ -296,11 +391,19 @@ export function ChatProvider({children}: ChatProviderProps): React.JSX.Element {
     if (!state.isInitialized) {
       return;
     }
+    if (state.isLoading) {
+      pendingPersistAfterStreamingRef.current = true;
+      return;
+    }
     if (conversationsPersistTimeoutRef.current) {
       clearTimeout(conversationsPersistTimeoutRef.current);
     }
+    const delayMs = pendingPersistAfterStreamingRef.current
+      ? Math.max(280, Math.floor(CONVERSATIONS_SAVE_DEBOUNCE_MS / 2))
+      : CONVERSATIONS_SAVE_DEBOUNCE_MS;
     conversationsPersistTimeoutRef.current = setTimeout(() => {
       conversationsPersistTimeoutRef.current = null;
+      pendingPersistAfterStreamingRef.current = false;
       void (async () => {
         try {
           await saveConversations(latestConversationsRef.current);
@@ -317,8 +420,8 @@ export function ChatProvider({children}: ChatProviderProps): React.JSX.Element {
           logError(TAG, 'Persistencia de conversas falhou', details);
         }
       })();
-    }, CONVERSATIONS_SAVE_DEBOUNCE_MS);
-  }, [state.conversations, state.isInitialized]);
+    }, delayMs);
+  }, [state.conversations, state.isInitialized, state.isLoading]);
 
   useEffect(() => {
     return () => {
@@ -462,8 +565,27 @@ export function ChatProvider({children}: ChatProviderProps): React.JSX.Element {
   );
 
   const updateLastMessage = useCallback(
-    (conversationId: string, content: string, error?: boolean) => {
-      dispatch({type: 'UPDATE_LAST_MESSAGE', conversationId, content, error});
+    (
+      conversationId: string,
+      content: string,
+      options?: {
+        error?: boolean;
+        sources?: MessageSource[];
+        searchDecision?: SearchDecision;
+        webValidationStatus?: WebValidationStatus;
+        touchUpdatedAt?: boolean;
+      },
+    ) => {
+      dispatch({
+        type: 'UPDATE_LAST_MESSAGE',
+        conversationId,
+        content,
+        error: options?.error,
+        sources: options?.sources,
+        searchDecision: options?.searchDecision,
+        webValidationStatus: options?.webValidationStatus,
+        touchUpdatedAt: options?.touchUpdatedAt,
+      });
     },
     [],
   );
