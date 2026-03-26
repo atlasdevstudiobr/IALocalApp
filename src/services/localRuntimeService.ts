@@ -1,6 +1,6 @@
 import {Message} from '../types';
 import {loadModelDownloadState} from './modelDownloadService';
-import {logError, logInfo, logWarn} from './logService';
+import * as LogService from './logService';
 
 const TAG = 'LocalRuntimeService';
 
@@ -29,6 +29,57 @@ const DEFAULT_PREDICT_TOKENS = 384;
 let runtimeState: RuntimeState = {status: 'not_loaded'};
 let runtimeContext: RuntimeContext | null = null;
 let runtimeLoadPromise: Promise<boolean> | null = null;
+const optionalRuntimeModuleErrorLogCache = new Set<string>();
+
+type AppPackageJson = {
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+};
+
+const appPackageJson: AppPackageJson = (() => {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return require('../../package.json') as AppPackageJson;
+  } catch {
+    return {};
+  }
+})();
+
+function logInfo(tag: string, message: string, details?: string): void {
+  try {
+    if (typeof LogService.logInfo === 'function') {
+      void LogService.logInfo(tag, message, details);
+      return;
+    }
+  } catch (_error) {
+    // Fallback de logger para evitar quebra estrutural.
+  }
+  console.info(`[${tag}] ${message}${details ? `\n${details}` : ''}`);
+}
+
+function logWarn(tag: string, message: string, details?: string): void {
+  try {
+    if (typeof LogService.logWarn === 'function') {
+      void LogService.logWarn(tag, message, details);
+      return;
+    }
+  } catch (_error) {
+    // Fallback de logger para evitar quebra estrutural.
+  }
+  console.warn(`[${tag}] ${message}${details ? `\n${details}` : ''}`);
+}
+
+function logError(tag: string, message: string, details?: string): void {
+  try {
+    if (typeof LogService.logError === 'function') {
+      void LogService.logError(tag, message, details);
+      return;
+    }
+  } catch (_error) {
+    // Fallback de logger para evitar quebra estrutural.
+  }
+  console.error(`[${tag}] ${message}${details ? `\n${details}` : ''}`);
+}
 
 function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -39,6 +90,46 @@ function toErrorDetails(error: unknown): string {
     return `${error.message}\n${error.stack ?? 'stack indisponivel'}`;
   }
   return String(error);
+}
+
+function normalizeRuntimeErrorMessage(message: string): string {
+  if (message.includes('Requiring unknown module "undefined"')) {
+    return 'Bridge JS do runtime nao resolvido (dependencia opcional ausente ou link quebrado).';
+  }
+  if (
+    message.includes("Cannot read property 'logInfo' of undefined") ||
+    message.includes("Cannot read properties of undefined (reading 'logInfo')")
+  ) {
+    return 'Logger interno do runtime veio indefinido (integracao JS/nativa inconsistente).';
+  }
+  return message;
+}
+
+function normalizeRuntimeErrorDetails(error: unknown): string {
+  return normalizeRuntimeErrorMessage(toErrorDetails(error));
+}
+
+function isRuntimeDependencyDeclared(packageName: string): boolean {
+  const deps = appPackageJson.dependencies ?? {};
+  const devDeps = appPackageJson.devDependencies ?? {};
+  return typeof deps[packageName] === 'string' || typeof devDeps[packageName] === 'string';
+}
+
+function reportOptionalRuntimeRequireFailure(
+  engine: string,
+  packageName: string,
+  error: unknown,
+): void {
+  const cacheKey = `${engine}:${packageName}`;
+  if (optionalRuntimeModuleErrorLogCache.has(cacheKey)) {
+    return;
+  }
+  optionalRuntimeModuleErrorLogCache.add(cacheKey);
+  logWarn(
+    TAG,
+    'Require opcional de runtime falhou',
+    `Engine: ${engine}\nPacote: ${packageName}\nMotivo: ${normalizeRuntimeErrorDetails(error)}`,
+  );
 }
 
 function buildPrompt(messages: Message[]): string {
@@ -58,6 +149,10 @@ function buildPrompt(messages: Message[]): string {
 }
 
 function getLlamaRnAdapter(): RuntimeAdapter | null {
+  if (!isRuntimeDependencyDeclared('llama.rn')) {
+    return null;
+  }
+
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const llamaRn = require('llama.rn') as {
@@ -108,12 +203,17 @@ function getLlamaRnAdapter(): RuntimeAdapter | null {
         };
       },
     };
-  } catch {
+  } catch (error) {
+    reportOptionalRuntimeRequireFailure('llama.rn', 'llama.rn', error);
     return null;
   }
 }
 
 function getReactNativeLlamaAdapter(): RuntimeAdapter | null {
+  if (!isRuntimeDependencyDeclared('react-native-llama')) {
+    return null;
+  }
+
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const reactNativeLlama = require('react-native-llama') as {
@@ -159,13 +259,19 @@ function getReactNativeLlamaAdapter(): RuntimeAdapter | null {
         };
       },
     };
-  } catch {
+  } catch (error) {
+    reportOptionalRuntimeRequireFailure(
+      'react-native-llama',
+      'react-native-llama',
+      error,
+    );
     return null;
   }
 }
 
-function resolveRuntimeAdapter(): RuntimeAdapter | null {
-  return getLlamaRnAdapter() || getReactNativeLlamaAdapter();
+function resolveRuntimeAdapters(): RuntimeAdapter[] {
+  const adapters = [getLlamaRnAdapter(), getReactNativeLlamaAdapter()];
+  return adapters.filter((adapter): adapter is RuntimeAdapter => adapter !== null);
 }
 
 export function getRuntimeState(): RuntimeState {
@@ -205,8 +311,8 @@ export async function ensureRuntimeReady(): Promise<boolean> {
         return false;
       }
 
-      const adapter = resolveRuntimeAdapter();
-      if (!adapter) {
+      const adapters = resolveRuntimeAdapters();
+      if (adapters.length === 0) {
         runtimeState = {
           status: 'error',
           modelPath: modelState.filePath,
@@ -216,32 +322,57 @@ export async function ensureRuntimeReady(): Promise<boolean> {
         return false;
       }
 
-      logInfo(
-        TAG,
-        'Tentativa de criar contexto do runtime iniciada',
-        `Engine: ${adapter.engine}\nModelo: ${modelState.filePath}`,
-      );
-      runtimeContext = await adapter.createContext(modelState.filePath);
-      logInfo(TAG, 'Tentativa de criar contexto do runtime concluida com sucesso');
+      const adapterErrors: string[] = [];
+      for (const adapter of adapters) {
+        logInfo(
+          TAG,
+          'Tentativa de criar contexto do runtime iniciada',
+          `Engine: ${adapter.engine}\nModelo: ${modelState.filePath}`,
+        );
+
+        try {
+          runtimeContext = await adapter.createContext(modelState.filePath);
+          logInfo(TAG, 'Tentativa de criar contexto do runtime concluida com sucesso');
+          runtimeState = {
+            status: 'ready',
+            modelPath: modelState.filePath,
+            engine: adapter.engine,
+          };
+          logInfo(
+            TAG,
+            'Runtime local carregado com sucesso',
+            `Engine: ${adapter.engine}\nModelo: ${modelState.filePath}`,
+          );
+          return true;
+        } catch (adapterError) {
+          runtimeContext = null;
+          const normalizedMessage = normalizeRuntimeErrorMessage(
+            toErrorMessage(adapterError),
+          );
+          adapterErrors.push(`${adapter.engine}: ${normalizedMessage}`);
+          logWarn(
+            TAG,
+            'Falha ao inicializar adapter de runtime; tentando proximo',
+            `Engine: ${adapter.engine}\nMotivo: ${normalizeRuntimeErrorDetails(adapterError)}`,
+          );
+        }
+      }
+
       runtimeState = {
-        status: 'ready',
+        status: 'error',
         modelPath: modelState.filePath,
-        engine: adapter.engine,
+        errorMessage: `Nenhum adapter de runtime inicializou com sucesso.\n${adapterErrors.join('\n')}`,
       };
-      logInfo(
-        TAG,
-        'Runtime local carregado com sucesso',
-        `Engine: ${adapter.engine}\nModelo: ${modelState.filePath}`,
-      );
-      return true;
+      logError(TAG, 'Falha ao carregar runtime', runtimeState.errorMessage);
+      return false;
     } catch (error) {
-      const errorMessage = toErrorMessage(error);
+      const errorMessage = normalizeRuntimeErrorMessage(toErrorMessage(error));
       runtimeState = {
         status: 'error',
         errorMessage,
       };
       runtimeContext = null;
-      logError(TAG, 'Falha ao carregar runtime', toErrorDetails(error));
+      logError(TAG, 'Falha ao carregar runtime', normalizeRuntimeErrorDetails(error));
       return false;
     } finally {
       runtimeLoadPromise = null;
@@ -273,7 +404,7 @@ export async function inferWithLocalRuntime(messages: Message[]): Promise<string
     logInfo(TAG, 'Retorno da inferencia local concluido', `Tamanho bruto: ${response.length}`);
     return response;
   } catch (error) {
-    logError(TAG, 'Erro durante inferencia local', toErrorDetails(error));
+    logError(TAG, 'Erro durante inferencia local', normalizeRuntimeErrorDetails(error));
     throw error;
   }
 }

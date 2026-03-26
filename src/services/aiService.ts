@@ -1,5 +1,5 @@
 import {Message} from '../types';
-import {logError, logInfo, logWarn} from './logService';
+import * as LogService from './logService';
 import {
   ensureRuntimeReady,
   getRuntimeState,
@@ -17,6 +17,42 @@ const STUB_RESPONSE =
   '\u2699\uFE0F Modelo local ainda nao instalado. Acesse Configuracoes para instalar o modelo Qwen2.5-3B.';
 const RUNTIME_FAILURE_FALLBACK =
   'Falha ao carregar o runtime local. Veja os logs.';
+
+function logInfo(tag: string, message: string, details?: string): void {
+  try {
+    if (typeof LogService.logInfo === 'function') {
+      void LogService.logInfo(tag, message, details);
+      return;
+    }
+  } catch (_error) {
+    // Fallback de logger para evitar quebra estrutural.
+  }
+  console.info(`[${tag}] ${message}${details ? `\n${details}` : ''}`);
+}
+
+function logWarn(tag: string, message: string, details?: string): void {
+  try {
+    if (typeof LogService.logWarn === 'function') {
+      void LogService.logWarn(tag, message, details);
+      return;
+    }
+  } catch (_error) {
+    // Fallback de logger para evitar quebra estrutural.
+  }
+  console.warn(`[${tag}] ${message}${details ? `\n${details}` : ''}`);
+}
+
+function logError(tag: string, message: string, details?: string): void {
+  try {
+    if (typeof LogService.logError === 'function') {
+      void LogService.logError(tag, message, details);
+      return;
+    }
+  } catch (_error) {
+    // Fallback de logger para evitar quebra estrutural.
+  }
+  console.error(`[${tag}] ${message}${details ? `\n${details}` : ''}`);
+}
 
 function toErrorDetails(error: unknown): string {
   if (error instanceof Error) {
