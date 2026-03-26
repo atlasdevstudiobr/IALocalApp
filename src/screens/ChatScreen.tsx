@@ -47,25 +47,35 @@ export default function ChatScreen(): React.JSX.Element {
 
   const [inputText, setInputText] = useState('');
   const flatListRef = useRef<FlatList<Message>>(null);
+  const renderCountRef = useRef(0);
+  renderCountRef.current += 1;
 
   // Resolve active conversation ID safely from route params/store/list
   const conversationId = useMemo(() => {
     const routeId = route.params?.conversationId;
-    if (routeId && state.conversations.some(c => c.id === routeId)) {
+    if (routeId) {
       return routeId;
     }
-    if (
-      state.currentConversationId &&
-      state.conversations.some(c => c.id === state.currentConversationId)
-    ) {
+    if (state.currentConversationId) {
       return state.currentConversationId;
     }
     return state.conversations[0]?.id ?? '';
   }, [route.params?.conversationId, state.currentConversationId, state.conversations]);
 
   const conversation = state.conversations.find(c => c.id === conversationId) ?? null;
-  const messages = conversation?.messages ?? [];
+  const messages = Array.isArray(conversation?.messages) ? conversation.messages : [];
   const isLoading = state.isLoading;
+  // Em Android, inverted + maintainVisibleContentPosition pode causar crash nativo da lista.
+  const maintainVisibleContentPosition =
+    Platform.OS === 'ios' ? {minIndexForVisible: 0} : undefined;
+
+  useEffect(() => {
+    logInfo(
+      TAG,
+      'Render do ChatScreen concluido',
+      `render=${renderCountRef.current} conversationId=${conversationId || 'none'} messages=${messages.length} currentConversationId=${state.currentConversationId ?? 'null'}`,
+    );
+  }, [conversationId, messages.length, state.currentConversationId]);
 
   // Sync current conversation when navigating directly to a chat
   useEffect(() => {
@@ -75,8 +85,15 @@ export default function ChatScreen(): React.JSX.Element {
   }, [conversationId, state.currentConversationId, setCurrentConversation]);
 
   useEffect(() => {
-    logInfo(TAG, 'Warmup do runtime disparado fora do clique em enviar');
-    void warmupRuntimeSafely();
+    void (async () => {
+      try {
+        logInfo(TAG, 'Warmup do runtime disparado fora do clique em enviar');
+        await warmupRuntimeSafely();
+        logInfo(TAG, 'Warmup do runtime finalizado no mount do ChatScreen');
+      } catch (error) {
+        logError(TAG, 'Erro no warmup do ChatScreen', toErrorDetails(error));
+      }
+    })();
   }, []);
 
   const handleSend = useCallback(async () => {
@@ -172,11 +189,21 @@ export default function ChatScreen(): React.JSX.Element {
   }, [navigation]);
 
   const renderMessage: ListRenderItem<Message> = useCallback(
-    ({item}) => <ChatBubble message={item} />,
+    ({item}) => {
+      if (!item || typeof item !== 'object') {
+        logError(TAG, 'Mensagem invalida detectada no renderItem do chat');
+        return null;
+      }
+      return <ChatBubble message={item} />;
+    },
     [],
   );
 
-  const keyExtractor = useCallback((item: Message) => item.id, []);
+  const keyExtractor = useCallback(
+    (item: Message, index: number) =>
+      typeof item?.id === 'string' && item.id ? item.id : `message-${index}`,
+    [],
+  );
 
   const title = conversation?.title ?? 'Nova Conversa';
 
@@ -228,7 +255,7 @@ export default function ChatScreen(): React.JSX.Element {
             contentContainerStyle={styles.messageList}
             showsVerticalScrollIndicator={false}
             keyboardShouldPersistTaps="handled"
-            maintainVisibleContentPosition={{minIndexForVisible: 0}}
+            maintainVisibleContentPosition={maintainVisibleContentPosition}
           />
         )}
 

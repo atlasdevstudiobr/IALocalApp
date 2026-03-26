@@ -1,18 +1,41 @@
-import React from 'react';
+import React, {useEffect, useRef} from 'react';
 import {View, Text, StyleSheet} from 'react-native';
 import {Message} from '../types';
 import {colors, spacing, fonts, radius} from '../theme';
 import {formatDate} from '../utils/helpers';
 import TypingIndicator from './TypingIndicator';
+import {logInfo} from '../services/logService';
 
 interface ChatBubbleProps {
   message: Message;
 }
 
 export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
-  const isUser = message.role === 'user';
+  const TAG = 'ChatBubble';
+  const renderCountRef = useRef(0);
+  renderCountRef.current += 1;
+
+  const safeRole = message.role === 'user' || message.role === 'assistant' || message.role === 'system'
+    ? message.role
+    : 'assistant';
+  const safeContent = typeof message.content === 'string' ? message.content : '';
+  const safeTimestamp =
+    typeof message.timestamp === 'number' && Number.isFinite(message.timestamp)
+      ? message.timestamp
+      : Date.now();
+  const safeId = typeof message.id === 'string' && message.id ? message.id : 'invalid-message-id';
+
+  const isUser = safeRole === 'user';
   const isError = message.error === true;
-  const isTyping = !isUser && message.content === '' && !isError;
+  const isTyping = !isUser && safeContent === '' && !isError;
+
+  useEffect(() => {
+    logInfo(
+      TAG,
+      'Render do ChatBubble concluido',
+      `render=${renderCountRef.current} id=${safeId} role=${safeRole} isTyping=${isTyping}`,
+    );
+  }, [safeId, safeRole, isTyping]);
 
   return (
     <View style={[styles.row, isUser ? styles.rowUser : styles.rowAssistant]}>
@@ -33,11 +56,11 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
           <Text
             selectable
             style={[styles.messageText, isError && styles.messageTextError]}>
-            {message.content}
+            {safeContent}
           </Text>
         )}
         {!isTyping && (
-          <Text style={styles.timestamp}>{formatDate(message.timestamp)}</Text>
+          <Text style={styles.timestamp}>{formatDate(safeTimestamp)}</Text>
         )}
       </View>
     </View>

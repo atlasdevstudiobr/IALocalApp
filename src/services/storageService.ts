@@ -13,9 +13,10 @@ export async function saveConversations(
   conversations: Conversation[],
 ): Promise<void> {
   try {
+    logInfo(TAG, 'Persistencia de conversas no AsyncStorage iniciada');
     const serialized = JSON.stringify(conversations);
     await AsyncStorage.setItem(CONVERSATIONS_KEY, serialized);
-    logInfo(TAG, `Saved ${conversations.length} conversation(s)`);
+    logInfo(TAG, `Persistencia de conversas no AsyncStorage concluida (${conversations.length})`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logError(TAG, 'Failed to save conversations', message);
@@ -29,15 +30,18 @@ export async function saveConversations(
  */
 export async function loadConversations(): Promise<Conversation[]> {
   try {
+    logInfo(TAG, 'Restore de conversas no AsyncStorage iniciado');
     const raw = await AsyncStorage.getItem(CONVERSATIONS_KEY);
     if (!raw) {
+      logInfo(TAG, 'Restore de conversas concluido (sem dados)');
       return [];
     }
     const parsed: Conversation[] = JSON.parse(raw);
     if (!Array.isArray(parsed)) {
+      logError(TAG, 'Restore de conversas encontrou payload invalido (nao array)');
       return [];
     }
-    logInfo(TAG, `Loaded ${parsed.length} conversation(s)`);
+    logInfo(TAG, `Restore de conversas concluido (${parsed.length})`);
     return parsed;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -51,7 +55,9 @@ export async function loadConversations(): Promise<Conversation[]> {
  */
 export async function saveCurrentConversationId(id: string): Promise<void> {
   try {
+    logInfo(TAG, 'Persistencia do currentConversationId iniciada', id);
     await AsyncStorage.setItem(CURRENT_CONVERSATION_KEY, id);
+    logInfo(TAG, 'Persistencia do currentConversationId concluida', id);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logError(TAG, 'Failed to save current conversation ID', message);
@@ -65,7 +71,9 @@ export async function saveCurrentConversationId(id: string): Promise<void> {
  */
 export async function loadCurrentConversationId(): Promise<string | null> {
   try {
+    logInfo(TAG, 'Restore do currentConversationId iniciado');
     const id = await AsyncStorage.getItem(CURRENT_CONVERSATION_KEY);
+    logInfo(TAG, 'Restore do currentConversationId concluido', id ?? 'null');
     return id;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
