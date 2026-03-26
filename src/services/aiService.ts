@@ -1,9 +1,11 @@
 import {Message} from '../types';
 import * as LogService from './logService';
+import {loadModelDownloadState} from './modelDownloadService';
 import {
   ensureRuntimeReady,
   getRuntimeState,
   inferWithLocalRuntime,
+  registerModelDownloadStateLoader,
   releaseRuntime,
   RuntimeStatus,
 } from './localRuntimeService';
@@ -17,6 +19,7 @@ const STUB_RESPONSE =
   '\u2699\uFE0F Modelo local ainda nao instalado. Acesse Configuracoes para instalar o modelo Qwen2.5-3B.';
 const RUNTIME_FAILURE_FALLBACK =
   'Falha ao carregar o runtime local. Veja os logs.';
+let runtimeBindingsInitialized = false;
 
 function logInfo(tag: string, message: string, details?: string): void {
   try {
@@ -61,7 +64,27 @@ function toErrorDetails(error: unknown): string {
   return String(error);
 }
 
+function ensureRuntimeBindings(): void {
+  if (runtimeBindingsInitialized) {
+    return;
+  }
+
+  if (typeof loadModelDownloadState !== 'function') {
+    logError(
+      TAG,
+      'Ligacao do runtime local falhou',
+      'ModelDownloadService.loadModelDownloadState indisponivel',
+    );
+    return;
+  }
+
+  registerModelDownloadStateLoader(loadModelDownloadState);
+  runtimeBindingsInitialized = true;
+  logInfo(TAG, 'Ligacao com ModelDownloadService registrada no LocalRuntimeService');
+}
+
 export async function warmupRuntimeSafely(): Promise<void> {
+  ensureRuntimeBindings();
   logInfo(TAG, 'Warmup seguro do runtime iniciado');
   try {
     const ready = await ensureRuntimeReady();
@@ -80,6 +103,7 @@ export async function warmupRuntimeSafely(): Promise<void> {
  * @returns Promise resolving to the assistant's response text
  */
 export async function generateResponse(messages: Message[]): Promise<string> {
+  ensureRuntimeBindings();
   const lastMessage = messages[messages.length - 1];
   logInfo(
     TAG,
@@ -144,6 +168,7 @@ export function isAIReady(): boolean {
  * Mantido por compatibilidade com chamadas antigas.
  */
 export function setModelLoaded(loaded: boolean): void {
+  ensureRuntimeBindings();
   if (loaded) {
     void ensureRuntimeReady();
   } else {
@@ -160,6 +185,7 @@ export function getAIRuntimeStatus(): RuntimeStatus {
  * Returns model info for display purposes.
  */
 export function getModelInfo() {
+  ensureRuntimeBindings();
   const runtime = getRuntimeState();
   return {
     name: 'Qwen2.5-3B-Instruct-Q4_K_M',
@@ -171,3 +197,5 @@ export function getModelInfo() {
     runtimeError: runtime.errorMessage,
   };
 }
+
+ensureRuntimeBindings();

@@ -1,5 +1,4 @@
 import {Message} from '../types';
-import {loadModelDownloadState} from './modelDownloadService';
 import * as LogService from './logService';
 
 const TAG = 'LocalRuntimeService';
@@ -23,27 +22,27 @@ interface RuntimeAdapter {
   createContext: (modelPath: string) => Promise<RuntimeContext>;
 }
 
+interface ModelDownloadStateSnapshot {
+  status: 'not_downloaded' | 'downloading' | 'ready' | 'error';
+  filePath?: string;
+}
+
+type ModelDownloadStateLoader = () => Promise<ModelDownloadStateSnapshot>;
+
+type MetroRequire = {
+  (moduleId: number): unknown;
+  resolveWeak?: (moduleName: string) => number;
+};
+
 const DEFAULT_CONTEXT_SIZE = 2048;
 const DEFAULT_PREDICT_TOKENS = 384;
 
 let runtimeState: RuntimeState = {status: 'not_loaded'};
 let runtimeContext: RuntimeContext | null = null;
 let runtimeLoadPromise: Promise<boolean> | null = null;
+let modelDownloadStateLoader: ModelDownloadStateLoader | null = null;
 const optionalRuntimeModuleErrorLogCache = new Set<string>();
-
-type AppPackageJson = {
-  dependencies?: Record<string, string>;
-  devDependencies?: Record<string, string>;
-};
-
-const appPackageJson: AppPackageJson = (() => {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return require('../../package.json') as AppPackageJson;
-  } catch {
-    return {};
-  }
-})();
+const optionalRuntimeModuleSkipLogCache = new Set<string>();
 
 function logInfo(tag: string, message: string, details?: string): void {
   try {
@@ -97,6 +96,12 @@ function normalizeRuntimeErrorMessage(message: string): string {
     return 'Bridge JS do runtime nao resolvido (dependencia opcional ausente ou link quebrado).';
   }
   if (
+    message.includes("Cannot read property 'loadModelDownloadState' of undefined") ||
+    message.includes("Cannot read properties of undefined (reading 'loadModelDownloadState')")
+  ) {
+    return 'Ligacao com ModelDownloadService invalida (loader de estado nao registrado).';
+  }
+  if (
     message.includes("Cannot read property 'logInfo' of undefined") ||
     message.includes("Cannot read properties of undefined (reading 'logInfo')")
   ) {
@@ -109,10 +114,21 @@ function normalizeRuntimeErrorDetails(error: unknown): string {
   return normalizeRuntimeErrorMessage(toErrorDetails(error));
 }
 
-function isRuntimeDependencyDeclared(packageName: string): boolean {
-  const deps = appPackageJson.dependencies ?? {};
-  const devDeps = appPackageJson.devDependencies ?? {};
-  return typeof deps[packageName] === 'string' || typeof devDeps[packageName] === 'string';
+function reportOptionalRuntimeModuleSkip(
+  engine: string,
+  packageName: string,
+  reason: string,
+): void {
+  const cacheKey = `${engine}:${packageName}:${reason}`;
+  if (optionalRuntimeModuleSkipLogCache.has(cacheKey)) {
+    return;
+  }
+  optionalRuntimeModuleSkipLogCache.add(cacheKey);
+  logInfo(
+    TAG,
+    'Adapter opcional de runtime ignorado',
+    `Engine: ${engine}\nPacote: ${packageName}\nMotivo: ${reason}`,
+  );
 }
 
 function reportOptionalRuntimeRequireFailure(
@@ -132,6 +148,49 @@ function reportOptionalRuntimeRequireFailure(
   );
 }
 
+function isNewArchitectureEnabled(): boolean {
+  const scope = globalThis as {__turboModuleProxy?: unknown};
+  return typeof scope.__turboModuleProxy === 'function';
+}
+
+function resolveOptionalRuntimeModule(engine: string, packageName: string): unknown | null {
+  const metroRequire = require as MetroRequire;
+  if (typeof metroRequire.resolveWeak !== 'function') {
+    reportOptionalRuntimeModuleSkip(engine, packageName, 'resolveWeak indisponivel no runtime JS');
+    return null;
+  }
+
+  try {
+    const moduleId = metroRequire.resolveWeak(packageName);
+    if (typeof moduleId !== 'number') {
+      reportOptionalRuntimeModuleSkip(
+        engine,
+        packageName,
+        `moduleId invalido retornado pelo bundler: ${String(moduleId)}`,
+      );
+      return null;
+    }
+    return metroRequire(moduleId);
+  } catch (error) {
+    reportOptionalRuntimeRequireFailure(engine, packageName, error);
+    return null;
+  }
+}
+
+async function loadModelDownloadStateFromLoader(): Promise<ModelDownloadStateSnapshot> {
+  if (typeof modelDownloadStateLoader !== 'function') {
+    throw new Error(
+      'ModelDownloadService.loadModelDownloadState nao registrado em LocalRuntimeService',
+    );
+  }
+
+  const state = await modelDownloadStateLoader();
+  if (!state || typeof state !== 'object') {
+    throw new Error('ModelDownloadService.loadModelDownloadState retornou estado invalido');
+  }
+  return state;
+}
+
 function buildPrompt(messages: Message[]): string {
   const prompt = messages
     .map(message => {
@@ -149,13 +208,22 @@ function buildPrompt(messages: Message[]): string {
 }
 
 function getLlamaRnAdapter(): RuntimeAdapter | null {
-  if (!isRuntimeDependencyDeclared('llama.rn')) {
+  if (!isNewArchitectureEnabled()) {
+    reportOptionalRuntimeModuleSkip(
+      'llama.rn',
+      'llama.rn',
+      'New Architecture desativada; adapter requer __turboModuleProxy',
+    );
+    return null;
+  }
+
+  const llamaRnModule = resolveOptionalRuntimeModule('llama.rn', 'llama.rn');
+  if (!llamaRnModule) {
     return null;
   }
 
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const llamaRn = require('llama.rn') as {
+    const llamaRn = llamaRnModule as {
       initLlama?: (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
       releaseAllLlama?: () => Promise<void>;
     };
@@ -210,13 +278,16 @@ function getLlamaRnAdapter(): RuntimeAdapter | null {
 }
 
 function getReactNativeLlamaAdapter(): RuntimeAdapter | null {
-  if (!isRuntimeDependencyDeclared('react-native-llama')) {
+  const reactNativeLlamaModule = resolveOptionalRuntimeModule(
+    'react-native-llama',
+    'react-native-llama',
+  );
+  if (!reactNativeLlamaModule) {
     return null;
   }
 
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const reactNativeLlama = require('react-native-llama') as {
+    const reactNativeLlama = reactNativeLlamaModule as {
       LlamaContext?: {
         create?: (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
       };
@@ -278,6 +349,11 @@ export function getRuntimeState(): RuntimeState {
   return {...runtimeState};
 }
 
+export function registerModelDownloadStateLoader(loader: ModelDownloadStateLoader): void {
+  modelDownloadStateLoader = loader;
+  logInfo(TAG, 'Loader de estado do modelo registrado no runtime local');
+}
+
 export async function ensureRuntimeReady(): Promise<boolean> {
   if (runtimeState.status === 'ready' && runtimeContext) {
     logInfo(TAG, 'ensureRuntimeReady: runtime ja pronto, reutilizando contexto');
@@ -295,7 +371,7 @@ export async function ensureRuntimeReady(): Promise<boolean> {
 
     try {
       logInfo(TAG, 'Checagem de modelo instalado iniciada');
-      const modelState = await loadModelDownloadState();
+      const modelState = await loadModelDownloadStateFromLoader();
       logInfo(
         TAG,
         'Checagem de modelo instalado concluida',
