@@ -80,6 +80,7 @@ export default function DrawerContent(
   const handleNewConversation = useCallback(() => {
     try {
       logInfo(TAG, 'Clique em Nova Conversa recebido');
+      logInfo(TAG, 'Handler de Nova Conversa iniciado');
       const id = createConversation();
       if (!id) {
         logError(TAG, 'Falha ao criar conversa: id invalido');
@@ -94,6 +95,7 @@ export default function DrawerContent(
       logInfo(TAG, 'Atualizacao da UI iniciada (navegacao para Chat)', id);
       navigation.navigate('Chat', {conversationId: id});
       logInfo(TAG, 'Atualizacao da UI concluida (navegacao para Chat)', id);
+      logInfo(TAG, 'Fluxo de Nova Conversa concluido com sucesso', id);
     } catch (error) {
       logError(TAG, 'Catch no fluxo de Nova Conversa', toErrorDetails(error));
     } finally {

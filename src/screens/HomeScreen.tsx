@@ -65,6 +65,7 @@ export default function HomeScreen(): React.JSX.Element {
   const handleStartChat = useCallback(() => {
     try {
       logInfo(TAG, 'Clique em Iniciar Conversa recebido');
+      logInfo(TAG, 'Handler de Iniciar Conversa iniciado');
       const id = createConversation();
       if (!id) {
         logError(TAG, 'Falha ao iniciar conversa: id invalido');
@@ -79,6 +80,7 @@ export default function HomeScreen(): React.JSX.Element {
       logInfo(TAG, 'Atualizacao da UI iniciada (navegacao para Chat)', id);
       navigation.navigate('Chat', {conversationId: id});
       logInfo(TAG, 'Atualizacao da UI concluida (navegacao para Chat)', id);
+      logInfo(TAG, 'Fluxo de Iniciar Conversa concluido com sucesso', id);
     } catch (error) {
       logError(TAG, 'Catch no fluxo de Iniciar Conversa', toErrorDetails(error));
     } finally {

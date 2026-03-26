@@ -177,7 +177,11 @@ function normalizeConversation(
   const fallbackId = generateId();
   const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : fallbackId;
   const title = typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : 'Nova Conversa';
-  const messages = Array.isArray(raw.messages) ? raw.messages : [];
+  const messages = Array.isArray(raw.messages)
+    ? raw.messages
+        .map(msg => normalizeMessage(msg))
+        .filter((msg): msg is Message => msg !== null)
+    : [];
   const now = Date.now();
   const createdAt = typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)
     ? raw.createdAt
@@ -187,6 +191,23 @@ function normalizeConversation(
     : createdAt;
 
   return {id, title, messages, createdAt, updatedAt};
+}
+
+function normalizeMessage(raw: Partial<Message> | null | undefined): Message | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : generateId();
+  const role =
+    raw.role === 'user' || raw.role === 'assistant' || raw.role === 'system'
+      ? raw.role
+      : 'assistant';
+  const content = typeof raw.content === 'string' ? raw.content : '';
+  const timestamp = typeof raw.timestamp === 'number' && Number.isFinite(raw.timestamp)
+    ? raw.timestamp
+    : Date.now();
+  const error = raw.error === true ? true : undefined;
+  return {id, role, content, timestamp, error};
 }
 
 // ---------------------------------------------------------------------------
@@ -344,9 +365,34 @@ export function ChatProvider({children}: ChatProviderProps): React.JSX.Element {
     }
   }, [state.conversations]);
 
-  const setCurrentConversation = useCallback((id: string | null) => {
-    dispatch({type: 'SET_CURRENT_CONVERSATION', id});
-  }, []);
+  const setCurrentConversation = useCallback(
+    (id: string | null) => {
+      try {
+        logInfo(TAG, 'Atualizacao de selectedConversation iniciada', id ?? 'null');
+        if (id === null) {
+          dispatch({type: 'SET_CURRENT_CONVERSATION', id: null});
+          logInfo(TAG, 'Atualizacao de selectedConversation concluida', 'null');
+          return;
+        }
+
+        const exists = state.conversations.some(conv => conv.id === id);
+        if (!exists) {
+          logError(
+            TAG,
+            'Atualizacao de selectedConversation ignorada: id inexistente',
+            id,
+          );
+          return;
+        }
+
+        dispatch({type: 'SET_CURRENT_CONVERSATION', id});
+        logInfo(TAG, 'Atualizacao de selectedConversation concluida', id);
+      } catch (error) {
+        logError(TAG, 'Catch ao atualizar selectedConversation', toErrorDetails(error));
+      }
+    },
+    [state.conversations],
+  );
 
   const addMessage = useCallback(
     (
