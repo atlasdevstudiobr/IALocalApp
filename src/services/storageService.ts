@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {Conversation} from '../types';
 import {logError, logInfo} from './logService';
+import {LOCAL_SAFETY_DISABLED_STORAGE_KEY} from './safetySettingsService';
 
 const TAG = 'StorageService';
 const CONVERSATIONS_KEY = '@alfaai_conversations';
@@ -90,6 +91,7 @@ export async function clearAllData(): Promise<void> {
     await AsyncStorage.multiRemove([
       CONVERSATIONS_KEY,
       CURRENT_CONVERSATION_KEY,
+      LOCAL_SAFETY_DISABLED_STORAGE_KEY,
     ]);
     logInfo(TAG, 'All data cleared');
   } catch (error) {

@@ -5,6 +5,11 @@ import {colors, spacing, fonts, radius} from '../theme';
 import {formatDate} from '../utils/helpers';
 import TypingIndicator from './TypingIndicator';
 import {logInfo} from '../services/logService';
+import {
+  getCachedLocalSafetyDisabled,
+  loadLocalSafetyDisabled,
+  subscribeLocalSafetyDisabled,
+} from '../services/safetySettingsService';
 
 interface ChatBubbleProps {
   message: Message;
@@ -13,7 +18,7 @@ interface ChatBubbleProps {
 type MarkdownBlock =
   | {type: 'heading'; level: 1 | 2 | 3; text: string}
   | {type: 'paragraph'; text: string}
-  | {type: 'list'; ordered: boolean; items: string[]}
+  | {type: 'list'; ordered: boolean; items: Array<{text: string; marker: number | null}>}
   | {type: 'divider'}
   | {type: 'code'; language: string; code: string};
 
@@ -125,8 +130,9 @@ function parseTextSegment(segment: string): MarkdownBlock[] {
   const blocks: MarkdownBlock[] = [];
   const lines = segment.split('\n');
   let paragraphLines: string[] = [];
-  let listItems: string[] = [];
+  let listItems: Array<{text: string; marker: number | null}> = [];
   let listOrdered: boolean | null = null;
+  let orderedListStart = 1;
 
   const flushParagraph = () => {
     if (paragraphLines.length === 0) {
@@ -213,13 +219,23 @@ function parseTextSegment(segment: string): MarkdownBlock[] {
         flushList();
       }
       listOrdered = ordered;
-      listItems.push(itemText);
+      if (ordered && listItems.length === 0) {
+        const parsedStart = Number(orderedMatch![1]);
+        orderedListStart = Number.isFinite(parsedStart) && parsedStart > 0 ? parsedStart : 1;
+      }
+      listItems.push({
+        text: itemText,
+        marker: ordered ? orderedListStart + listItems.length : null,
+      });
       continue;
     }
 
     if (listItems.length > 0) {
       const lastIndex = listItems.length - 1;
-      listItems[lastIndex] = `${listItems[lastIndex]} ${line}`.trim();
+      listItems[lastIndex] = {
+        ...listItems[lastIndex],
+        text: `${listItems[lastIndex].text} ${line}`.trim(),
+      };
       continue;
     }
 
@@ -229,6 +245,52 @@ function parseTextSegment(segment: string): MarkdownBlock[] {
   flushParagraph();
   flushList();
   return blocks;
+}
+
+function normalizeListBlocks(blocks: MarkdownBlock[]): MarkdownBlock[] {
+  const normalized: MarkdownBlock[] = [];
+  let orderedMarkerCursor: number | null = null;
+
+  for (const block of blocks) {
+    if (block.type !== 'list') {
+      orderedMarkerCursor = null;
+      normalized.push(block);
+      continue;
+    }
+
+    if (!block.ordered) {
+      orderedMarkerCursor = null;
+      const previous = normalized[normalized.length - 1];
+      if (previous?.type === 'list' && !previous.ordered) {
+        previous.items = [...previous.items, ...block.items];
+      } else {
+        normalized.push({
+          ...block,
+          items: [...block.items],
+        });
+      }
+      continue;
+    }
+
+    const startMarker: number = orderedMarkerCursor ?? block.items[0]?.marker ?? 1;
+    const normalizedItems = block.items.map((item, index) => ({
+      ...item,
+      marker: startMarker + index,
+    }));
+    orderedMarkerCursor = startMarker + normalizedItems.length;
+
+    const previous = normalized[normalized.length - 1];
+    if (previous?.type === 'list' && previous.ordered) {
+      previous.items = [...previous.items, ...normalizedItems];
+    } else {
+      normalized.push({
+        ...block,
+        items: normalizedItems,
+      });
+    }
+  }
+
+  return normalized;
 }
 
 function parseMarkdownBlocks(content: string): MarkdownBlock[] {
@@ -266,10 +328,12 @@ function parseMarkdownBlocks(content: string): MarkdownBlock[] {
     blocks.push(...parseTextSegment(trailing));
   }
 
-  if (blocks.length === 0) {
+  const normalizedBlocks = normalizeListBlocks(blocks);
+
+  if (normalizedBlocks.length === 0) {
     return [{type: 'paragraph', text: normalized}];
   }
-  return blocks;
+  return normalizedBlocks;
 }
 
 export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
@@ -278,6 +342,9 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
   const copyResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   renderCountRef.current += 1;
   const [copiedBlockIndex, setCopiedBlockIndex] = useState<number | null>(null);
+  const [isLocalSafetyDisabled, setIsLocalSafetyDisabled] = useState<boolean>(
+    getCachedLocalSafetyDisabled(),
+  );
 
   const safeRole = message.role === 'user' || message.role === 'assistant' || message.role === 'system'
     ? message.role
@@ -292,11 +359,11 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
   const isUser = safeRole === 'user';
   const isError = message.error === true;
   const sanitizedAssistantContent = useMemo(
-    () => (isUser ? rawContent : sanitizeAssistantDisplayContent(rawContent)),
-    [isUser, rawContent],
+    () => (isUser || isLocalSafetyDisabled ? rawContent : sanitizeAssistantDisplayContent(rawContent)),
+    [isUser, rawContent, isLocalSafetyDisabled],
   );
   const safeContent =
-    !isUser && rawContent.trim() && !sanitizedAssistantContent.trim()
+    !isUser && !isLocalSafetyDisabled && rawContent.trim() && !sanitizedAssistantContent.trim()
       ? DISPLAY_SANITIZATION_FALLBACK
       : sanitizedAssistantContent;
   const isTyping = !isUser && rawContent.trim() === '' && !isError;
@@ -340,12 +407,28 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
   }, []);
 
   useEffect(() => {
+    let isMounted = true;
+    void loadLocalSafetyDisabled().then(value => {
+      if (isMounted) {
+        setIsLocalSafetyDisabled(value);
+      }
+    });
+    const unsubscribe = subscribeLocalSafetyDisabled(value => {
+      setIsLocalSafetyDisabled(value);
+    });
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
     logInfo(
       TAG,
       'Render do ChatBubble concluido',
-      `render=${renderCountRef.current} id=${safeId} role=${safeRole} isTyping=${isTyping}`,
+      `render=${renderCountRef.current} id=${safeId} role=${safeRole} isTyping=${isTyping} localSafetyDisabled=${isLocalSafetyDisabled}`,
     );
-  }, [safeId, safeRole, isTyping]);
+  }, [safeId, safeRole, isTyping, isLocalSafetyDisabled]);
 
   useEffect(() => {
     return () => {
@@ -415,12 +498,12 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
                             block.ordered ? styles.listMarkerOrdered : styles.listMarkerBullet,
                             isError && styles.messageTextError,
                           ]}>
-                          {block.ordered ? `${itemIndex + 1}.` : '\u2022'}
+                          {block.ordered ? `${item.marker ?? itemIndex + 1}.` : '\u2022'}
                         </Text>
                         <Text
                           selectable
                           style={[styles.messageText, styles.listText, isError && styles.messageTextError]}>
-                          {renderInline(item, `li-${blockIndex}-${itemIndex}`)}
+                          {renderInline(item.text, `li-${blockIndex}-${itemIndex}`)}
                         </Text>
                       </View>
                     ))}

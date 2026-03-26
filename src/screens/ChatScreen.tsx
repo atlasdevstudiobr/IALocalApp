@@ -15,7 +15,7 @@ import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 
 import {Message} from '../types';
 import {useChatStore} from '../store/chatStore';
-import {generateResponse, warmupRuntimeSafely} from '../services/aiService';
+import {generateResponseStream, warmupRuntimeSafely} from '../services/aiService';
 import {logError, logInfo} from '../services/logService';
 import ChatBubble from '../components/ChatBubble';
 import ChatInput from '../components/ChatInput';
@@ -29,6 +29,7 @@ type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
 const TAG = 'ChatScreen';
 const SEND_FALLBACK_MESSAGE = 'Falha ao carregar o runtime local. Veja os logs.';
+const STREAM_UPDATE_INTERVAL_MS = 45;
 
 function toErrorDetails(error: unknown): string {
   if (error instanceof Error) {
@@ -103,6 +104,38 @@ export default function ChatScreen(): React.JSX.Element {
   const handleSend = useCallback(async () => {
     let targetConversationId = conversationId;
     let assistantPlaceholderCreated = false;
+    let streamTimer: ReturnType<typeof setTimeout> | null = null;
+    let pendingStreamText = '';
+    let lastStreamPushAt = 0;
+
+    const flushStreamUpdate = () => {
+      if (!targetConversationId || !assistantPlaceholderCreated || !pendingStreamText) {
+        streamTimer = null;
+        return;
+      }
+      updateLastMessage(targetConversationId, pendingStreamText);
+      lastStreamPushAt = Date.now();
+      streamTimer = null;
+    };
+
+    const scheduleStreamUpdate = (partialText: string) => {
+      pendingStreamText = partialText;
+      const now = Date.now();
+      const elapsed = now - lastStreamPushAt;
+      if (elapsed >= STREAM_UPDATE_INTERVAL_MS) {
+        if (streamTimer) {
+          clearTimeout(streamTimer);
+          streamTimer = null;
+        }
+        flushStreamUpdate();
+        return;
+      }
+      if (streamTimer) {
+        return;
+      }
+      streamTimer = setTimeout(flushStreamUpdate, STREAM_UPDATE_INTERVAL_MS - elapsed);
+    };
+
     try {
       logInfo(TAG, 'Clique em enviar recebido');
       const trimmed = inputText.trim();
@@ -145,11 +178,21 @@ export default function ChatScreen(): React.JSX.Element {
       }];
 
       logInfo(TAG, 'Entrada no AIService iniciada');
-      const response = await generateResponse(allMessages);
+      const response = await generateResponseStream(allMessages, (partialText: string) => {
+        if (!partialText) {
+          return;
+        }
+        scheduleStreamUpdate(partialText);
+      });
       logInfo(TAG, 'Entrada no AIService concluida');
+      if (streamTimer) {
+        clearTimeout(streamTimer);
+        streamTimer = null;
+      }
+      flushStreamUpdate();
 
       if (!response) {
-        logError(TAG, 'generateResponse retornou null/undefined/vazio no ChatScreen');
+        logError(TAG, 'generateResponseStream retornou null/undefined/vazio no ChatScreen');
         updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, true);
         logInfo(TAG, 'Fallback aplicado no ChatScreen apos retorno invalido');
         return;
@@ -159,6 +202,10 @@ export default function ChatScreen(): React.JSX.Element {
       logInfo(TAG, 'Mensagem do assistente atualizada com retorno da inferencia');
     } catch (error) {
       logError(TAG, 'Catch no fluxo de envio do chat', toErrorDetails(error));
+      if (streamTimer) {
+        clearTimeout(streamTimer);
+        streamTimer = null;
+      }
       if (targetConversationId) {
         if (assistantPlaceholderCreated) {
           updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, true);
