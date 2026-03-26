@@ -14,12 +14,77 @@ type MarkdownBlock =
   | {type: 'heading'; level: 1 | 2 | 3; text: string}
   | {type: 'paragraph'; text: string}
   | {type: 'list'; ordered: boolean; items: string[]}
+  | {type: 'divider'}
   | {type: 'code'; language: string; code: string};
 
 type InlineChunk =
   | {type: 'text'; value: string}
   | {type: 'bold'; value: string}
   | {type: 'code'; value: string};
+
+const DISPLAY_SANITIZATION_FALLBACK = 'Nao consegui exibir parte desta resposta com seguranca.';
+const INTERNAL_DISPLAY_LABEL_PATTERN =
+  /^(?:\*\*|__)?\s*(sistema|system|diretriz interna|instru(?:cao|ção)(?: interna)?|instrucoes internas|instruções internas|prompt|resposta esperada)\s*(?:\*\*|__)?\s*:/i;
+const INTERNAL_DISPLAY_ROLE_PATTERN = /^(usuario|user|sistema|system)\s*:/i;
+const ASSISTANT_DISPLAY_ROLE_PATTERN = /^(assistente|assistant)\s*:\s*/i;
+const INTERNAL_DISPLAY_PERSONA_PATTERN = /(?:voce|você)\s+e\s+o\s+alfa\s+ai/i;
+const TECHNICAL_DISPLAY_LEAK_PATTERN =
+  /\b(n_predict|stopped_limit|tokens_predicted|context_full|prompt chars|last user chars|contexto usado|engine:\s*llama\.rn)\b/i;
+const INTERNAL_SIGNAL_DISPLAY_PATTERN =
+  /(voce e o alfa ai|você é o alfa ai|nunca revele, copie ou descreva instrucoes internas|evite formalidade excessiva|pergunta curta pede resposta curta|organize em markdown com titulos curtos|diretriz interna)/i;
+
+function normalizeDisplayLeakLine(rawLine: string): string {
+  return rawLine
+    .replace(/^\s*[-*+]\s*/, '')
+    .replace(/^\s*>\s?/, '')
+    .replace(/\*\*/g, '')
+    .replace(/__/g, '')
+    .trim();
+}
+
+function sanitizeAssistantDisplayContent(content: string): string {
+  const normalized = content
+    .replace(/\r\n/g, '\n')
+    .replace(/<think>[\s\S]*?<\/think>/gi, ' ')
+    .replace(/<\|im_start\|>[\s\S]*?<\|im_end\|>/gi, ' ')
+    .replace(/<\|[^|]+?\|>/g, ' ')
+    .trim();
+  if (!normalized) {
+    return '';
+  }
+
+  const safeLines: string[] = [];
+  for (const rawLine of normalized.split('\n')) {
+    const line = normalizeDisplayLeakLine(rawLine);
+    if (!line) {
+      safeLines.push('');
+      continue;
+    }
+
+    if (INTERNAL_DISPLAY_ROLE_PATTERN.test(line)) {
+      break;
+    }
+    if (ASSISTANT_DISPLAY_ROLE_PATTERN.test(line)) {
+      const withoutRole = line.replace(ASSISTANT_DISPLAY_ROLE_PATTERN, '').trim();
+      if (withoutRole) {
+        safeLines.push(withoutRole);
+      }
+      continue;
+    }
+    if (
+      INTERNAL_DISPLAY_LABEL_PATTERN.test(line) ||
+      INTERNAL_DISPLAY_PERSONA_PATTERN.test(line) ||
+      TECHNICAL_DISPLAY_LEAK_PATTERN.test(line) ||
+      INTERNAL_SIGNAL_DISPLAY_PATTERN.test(line)
+    ) {
+      continue;
+    }
+
+    safeLines.push(rawLine.trimEnd());
+  }
+
+  return safeLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
 
 function parseInlineChunks(text: string): InlineChunk[] {
   const chunks: InlineChunk[] = [];
@@ -105,7 +170,21 @@ function parseTextSegment(segment: string): MarkdownBlock[] {
       continue;
     }
 
-    const subtitleMatch = line.match(/^([A-Z0-9][^:]{1,54}):$/);
+    const strongSubtitleMatch = line.match(/^\*\*([^*\n:]{2,64})\*\*:?$/);
+    if (strongSubtitleMatch) {
+      flushParagraph();
+      flushList();
+      blocks.push({
+        type: 'heading',
+        level: 2,
+        text: strongSubtitleMatch[1].trim(),
+      });
+      continue;
+    }
+
+    const subtitleMatch = line.match(
+      /^(?:\*\*|__)?\s*([A-Za-zÀ-ÿ0-9][^:]{1,64})\s*:\s*(?:\*\*|__)?$/,
+    );
     if (subtitleMatch) {
       flushParagraph();
       flushList();
@@ -117,8 +196,15 @@ function parseTextSegment(segment: string): MarkdownBlock[] {
       continue;
     }
 
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(line)) {
+      flushParagraph();
+      flushList();
+      blocks.push({type: 'divider'});
+      continue;
+    }
+
     const orderedMatch = line.match(/^(\d+)[.)]\s+(.+)$/);
-    const unorderedMatch = line.match(/^[-*+]\s+(.+)$/);
+    const unorderedMatch = line.match(/^[-*+•]\s+(.+)$/);
     if (orderedMatch || unorderedMatch) {
       flushParagraph();
       const ordered = Boolean(orderedMatch);
@@ -196,7 +282,7 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
   const safeRole = message.role === 'user' || message.role === 'assistant' || message.role === 'system'
     ? message.role
     : 'assistant';
-  const safeContent = typeof message.content === 'string' ? message.content : '';
+  const rawContent = typeof message.content === 'string' ? message.content : '';
   const safeTimestamp =
     typeof message.timestamp === 'number' && Number.isFinite(message.timestamp)
       ? message.timestamp
@@ -205,7 +291,15 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
 
   const isUser = safeRole === 'user';
   const isError = message.error === true;
-  const isTyping = !isUser && safeContent === '' && !isError;
+  const sanitizedAssistantContent = useMemo(
+    () => (isUser ? rawContent : sanitizeAssistantDisplayContent(rawContent)),
+    [isUser, rawContent],
+  );
+  const safeContent =
+    !isUser && rawContent.trim() && !sanitizedAssistantContent.trim()
+      ? DISPLAY_SANITIZATION_FALLBACK
+      : sanitizedAssistantContent;
+  const isTyping = !isUser && rawContent.trim() === '' && !isError;
   const markdownBlocks = useMemo(() => parseMarkdownBlocks(safeContent), [safeContent]);
 
   const renderInline = useCallback((text: string, keyPrefix: string): React.ReactNode[] => {
@@ -359,6 +453,10 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
                 );
               }
 
+              if (block.type === 'divider') {
+                return <View key={`d-${blockIndex}`} style={styles.divider} />;
+              }
+
               return (
                 <Text
                   key={`p-${blockIndex}`}
@@ -412,6 +510,11 @@ const styles = StyleSheet.create({
     borderBottomLeftRadius: radius.sm,
     borderLeftWidth: 3,
     borderLeftColor: colors.primary,
+    shadowColor: '#000000',
+    shadowOpacity: 0.24,
+    shadowRadius: 8,
+    shadowOffset: {width: 0, height: 2},
+    elevation: 2,
   },
   bubbleError: {
     borderLeftColor: colors.danger,
@@ -437,13 +540,15 @@ const styles = StyleSheet.create({
   },
   paragraphText: {
     fontSize: fonts.sizes.base,
-    lineHeight: 24,
-    marginBottom: spacing.md,
+    lineHeight: 25,
+    marginBottom: spacing.lg,
   },
   headingBlock: {
-    marginTop: spacing.xs,
-    marginBottom: spacing.sm,
-    paddingLeft: spacing.sm,
+    marginTop: spacing.sm,
+    marginBottom: spacing.md,
+    paddingLeft: spacing.md,
+    paddingRight: spacing.sm,
+    paddingVertical: spacing.xs,
     borderLeftWidth: 3,
     borderRadius: radius.sm,
   },
@@ -466,38 +571,38 @@ const styles = StyleSheet.create({
     borderLeftColor: colors.danger,
   },
   heading1: {
-    fontSize: 28,
-    lineHeight: 34,
+    fontSize: 30,
+    lineHeight: 36,
     fontWeight: '800',
     color: colors.primary,
-    marginBottom: 2,
+    marginBottom: 3,
   },
   heading2: {
-    fontSize: 23,
-    lineHeight: 30,
+    fontSize: 24,
+    lineHeight: 31,
     fontWeight: '700',
-    marginBottom: 2,
+    marginBottom: 3,
   },
   heading3: {
-    fontSize: 19,
+    fontSize: 20,
     lineHeight: 26,
     fontWeight: '700',
     color: colors.textSecondary,
   },
   listBlock: {
-    marginBottom: spacing.md,
-    paddingLeft: 2,
+    marginBottom: spacing.lg,
+    paddingLeft: spacing.xs,
   },
   listRow: {
     flexDirection: 'row',
     alignItems: 'flex-start',
-    marginBottom: spacing.sm,
+    marginBottom: spacing.md,
   },
   listMarker: {
     color: colors.text,
     fontSize: fonts.sizes.base,
-    lineHeight: 25,
-    minWidth: 22,
+    lineHeight: 26,
+    minWidth: 24,
     fontWeight: '700',
     marginTop: 1,
   },
@@ -509,7 +614,13 @@ const styles = StyleSheet.create({
   },
   listText: {
     flex: 1,
-    lineHeight: 25,
+    lineHeight: 26,
+  },
+  divider: {
+    height: 1,
+    backgroundColor: colors.border,
+    marginVertical: spacing.md,
+    opacity: 0.9,
   },
   codeBlock: {
     backgroundColor: colors.surfaceElevated,
@@ -563,7 +674,7 @@ const styles = StyleSheet.create({
   },
   inlineBold: {
     color: colors.text,
-    fontWeight: '700',
+    fontWeight: '800',
   },
   inlineCode: {
     color: colors.primary,

@@ -33,7 +33,26 @@ const INTERNAL_PROMPT_SIGNALS = [
   'diretriz interna: responda em 1 ou 2 frases curtas',
   'diretriz interna: o usuario pediu profundidade',
   'diretriz interna: responda de forma objetiva',
+  'sistema:',
+  'system:',
+  'instrução:',
+  'instrucao:',
+  'instruções internas',
+  'instrucoes internas',
+  'prompt:',
+  'resposta esperada:',
+  'n_predict=',
+  'tokens_predicted=',
+  'context_full=',
+  'engine: llama.rn',
 ];
+const INTERNAL_LABEL_LINE_PATTERN =
+  /^(?:\*\*|__)?\s*(sistema|system|diretriz interna|instru(?:cao|ção)(?: interna)?|instrucoes internas|instruções internas|prompt|resposta esperada)\s*(?:\*\*|__)?\s*:/i;
+const INTERNAL_ROLE_LINE_PATTERN = /^(usuario|user|sistema|system)\s*:/i;
+const ASSISTANT_ROLE_LINE_PATTERN = /^(assistente|assistant)\s*:\s*/i;
+const INTERNAL_PERSONA_PATTERN = /(?:voce|você)\s+e\s+o\s+alfa\s+ai/i;
+const TECHNICAL_LEAK_LINE_PATTERN =
+  /\b(n_predict|stopped_limit|tokens_predicted|context_full|prompt chars|last user chars|contexto usado|engine:\s*llama\.rn)\b/i;
 let runtimeBindingsInitialized = false;
 
 function logInfo(tag: string, message: string, details?: string): void {
@@ -90,6 +109,15 @@ function countPromptLeakSignals(content: string): number {
   return matches;
 }
 
+function normalizeLeakLine(rawLine: string): string {
+  return rawLine
+    .replace(/^\s*[-*+]\s*/, '')
+    .replace(/^\s*>\s?/, '')
+    .replace(/\*\*/g, '')
+    .replace(/__/g, '')
+    .trim();
+}
+
 function extractLastAssistantSegment(content: string): string {
   const pattern = /(?:^|\n)\s*(assistente|assistant)\s*:\s*/gi;
   let lastIndex = -1;
@@ -115,37 +143,52 @@ function sanitizeOutputOnce(content: string): string {
     return '';
   }
 
+  normalized = normalized.replace(/\u0000/g, '');
   normalized = normalized.replace(/<think>[\s\S]*?<\/think>/gi, ' ').trim();
   normalized = normalized.replace(/<\|im_start\|>[\s\S]*?<\|im_end\|>/gi, ' ').trim();
   normalized = normalized.replace(/<\|[^|]+?\|>/g, '').trim();
 
-  while (/^(assistente|assistant)\s*:/i.test(normalized)) {
-    normalized = normalized.replace(/^(assistente|assistant)\s*:\s*/i, '').trim();
+  while (ASSISTANT_ROLE_LINE_PATTERN.test(normalized)) {
+    normalized = normalized.replace(ASSISTANT_ROLE_LINE_PATTERN, '').trim();
   }
 
-  if (/^(sistema|system|diretriz interna|instrucoes internas)\s*:/i.test(normalized)) {
+  if (INTERNAL_LABEL_LINE_PATTERN.test(normalizeLeakLine(normalized))) {
     normalized = extractLastAssistantSegment(normalized);
   }
 
   const safeLines: string[] = [];
   for (const rawLine of normalized.split('\n')) {
-    const line = rawLine.trim();
+    const line = normalizeLeakLine(rawLine);
     if (!line) {
       safeLines.push('');
       continue;
     }
 
-    if (/^(usuario|user)\s*:/i.test(line)) {
+    if (INTERNAL_ROLE_LINE_PATTERN.test(line)) {
       break;
     }
-    if (/^(sistema|system|diretriz interna|instrucoes internas)\s*:/i.test(line)) {
-      if (safeLines.length === 0) {
-        continue;
+    if (ASSISTANT_ROLE_LINE_PATTERN.test(line)) {
+      const withoutLabel = line.replace(ASSISTANT_ROLE_LINE_PATTERN, '').trim();
+      if (withoutLabel) {
+        safeLines.push(withoutLabel);
       }
-      break;
+      continue;
     }
 
-    safeLines.push(rawLine);
+    if (INTERNAL_LABEL_LINE_PATTERN.test(line)) {
+      continue;
+    }
+    if (INTERNAL_PERSONA_PATTERN.test(line)) {
+      continue;
+    }
+    if (TECHNICAL_LEAK_LINE_PATTERN.test(line)) {
+      continue;
+    }
+    if (countPromptLeakSignals(line) >= 1) {
+      continue;
+    }
+
+    safeLines.push(rawLine.trimEnd());
   }
 
   return safeLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
@@ -156,14 +199,22 @@ function normalizeModelResponse(content: string): string {
     return '';
   }
 
-  let normalized = sanitizeOutputOnce(content);
+  let normalized = content;
+  for (let pass = 0; pass < 4; pass += 1) {
+    const next = sanitizeOutputOnce(normalized);
+    if (!next || next === normalized) {
+      normalized = next;
+      break;
+    }
+    normalized = next;
+  }
   if (!normalized) {
     return '';
   }
 
   const hasRoleLeakShape =
     /^(sistema|system)\s*:/i.test(normalized) && /\n\s*(usuario|user)\s*:/i.test(normalized);
-  const hasPromptLeakSignals = countPromptLeakSignals(normalized) >= 2;
+  const hasPromptLeakSignals = countPromptLeakSignals(normalized) >= 1;
   if (hasRoleLeakShape || hasPromptLeakSignals) {
     const extractedAssistant = extractLastAssistantSegment(normalized);
     normalized = sanitizeOutputOnce(extractedAssistant);
@@ -176,11 +227,16 @@ function normalizeModelResponse(content: string): string {
   if (countPromptLeakSignals(normalized) >= 2) {
     return '';
   }
-  if (/^(sistema|system|diretriz interna|instrucoes internas)\s*:/i.test(normalized)) {
+  if (INTERNAL_LABEL_LINE_PATTERN.test(normalizeLeakLine(normalized))) {
+    return '';
+  }
+  if (INTERNAL_PERSONA_PATTERN.test(normalized) && normalized.length <= 180) {
     return '';
   }
 
-  const leakedRoleMatch = normalized.search(/\n\s*(usuario|sistema|user|system)\s*:/i);
+  const leakedRoleMatch = normalized.search(
+    /\n\s*(usuario|sistema|user|system|diretriz interna|instru(?:cao|ção)|prompt)\s*:/i,
+  );
   if (leakedRoleMatch >= 0) {
     normalized = normalized.slice(0, leakedRoleMatch).trim();
   }
@@ -220,6 +276,84 @@ function keepCasualReplyConcise(response: string, lastUserContent: string): stri
   }
 
   return `${response.slice(0, 217).trim()}...`;
+}
+
+function keepShortQuestionReplyConcise(response: string, lastUserContent: string): string {
+  if (!response || !lastUserContent) {
+    return response;
+  }
+
+  const normalizedUser = lastUserContent.trim();
+  if (!normalizedUser) {
+    return response;
+  }
+
+  const words = normalizedUser.split(/\s+/).length;
+  const asksDetail =
+    /\b(explique|explica|detalhe|detalhado|aprofunde|aprofundar|passo a passo|compare|analise)\b/i.test(
+      normalizedUser,
+    );
+  const isShortQuestion = normalizedUser.endsWith('?') && normalizedUser.length <= 72 && words <= 12;
+  if (!isShortQuestion || asksDetail || response.length <= 280) {
+    return response;
+  }
+
+  const firstParagraph = response.split(/\n{2,}/)[0].trim();
+  if (firstParagraph.length >= 16 && firstParagraph.length <= 240) {
+    return firstParagraph;
+  }
+
+  const sentenceMatches = response.match(/[^.!?]+[.!?]/g);
+  if (sentenceMatches && sentenceMatches.length > 0) {
+    const firstTwo = sentenceMatches
+      .slice(0, 2)
+      .join(' ')
+      .trim();
+    if (firstTwo.length >= 16 && firstTwo.length <= 240) {
+      return firstTwo;
+    }
+  }
+
+  return `${response.slice(0, 237).trim().replace(/[,:;\-]+$/, '')}.`;
+}
+
+function hasUnclosedCodeFence(content: string): boolean {
+  const fences = content.match(/```/g);
+  return Boolean(fences && fences.length % 2 !== 0);
+}
+
+function hasFollowupClosing(content: string): boolean {
+  return /(quer que eu|se quiser, posso)/i.test(content);
+}
+
+function ensureNaturalResponseEnding(response: string): string {
+  let normalized = response.trim();
+  if (!normalized) {
+    return '';
+  }
+
+  if (hasUnclosedCodeFence(normalized)) {
+    normalized = `${normalized}\n\`\`\``;
+  }
+
+  if (/[:;,\-]\s*$/.test(normalized)) {
+    normalized = normalized.replace(/[:;,\-]\s*$/, '.');
+  }
+
+  if (!/[.!?`)]$/.test(normalized)) {
+    if (normalized.length <= 180) {
+      return `${normalized}.`;
+    }
+    return `${normalized}\n\nSe quiser, posso resumir isso.`;
+  }
+
+  const paragraphCount = normalized.split(/\n{2,}/).filter(Boolean).length;
+  const shouldAddFollowup = normalized.length >= 420 || paragraphCount >= 3;
+  if (shouldAddFollowup && !hasFollowupClosing(normalized) && !/\?\s*$/.test(normalized)) {
+    normalized = `${normalized}\n\nSe quiser, posso resumir isso.`;
+  }
+
+  return normalized.trim();
 }
 
 function ensureRuntimeBindings(): void {
@@ -307,7 +441,11 @@ export async function generateResponse(messages: Message[]): Promise<string> {
     }
     const lastUserContent = getLastUserContent(messages);
     const normalizedResponse = normalizeModelResponse(response);
-    const finalResponse = keepCasualReplyConcise(normalizedResponse, lastUserContent);
+    const conciseResponse = keepShortQuestionReplyConcise(
+      keepCasualReplyConcise(normalizedResponse, lastUserContent),
+      lastUserContent,
+    );
+    const finalResponse = normalizeModelResponse(ensureNaturalResponseEnding(conciseResponse));
     if (!finalResponse.trim()) {
       logWarn(TAG, 'Resposta descartada por sanitizacao/empty output, aplicando fallback seguro');
       return OUTPUT_SANITIZATION_FALLBACK;

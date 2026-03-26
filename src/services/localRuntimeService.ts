@@ -311,15 +311,15 @@ function buildDynamicPromptInstruction(
   const isCasualReaction = SHORT_CASUAL_REACTION_PATTERN.test(normalized) && wordCount <= 8;
 
   if (requestedItemCount !== null) {
-    return `Diretriz interna: responda de forma objetiva e entregue exatamente ${requestedItemCount} item(ns).`;
+    return `Resposta esperada: entregue exatamente ${requestedItemCount} item(ns), de forma objetiva.`;
   }
   if (isGreeting || isCasualReaction || isShortMessage) {
-    return 'Diretriz interna: responda em 1 ou 2 frases curtas, com tom natural e direto.';
+    return 'Resposta esperada: 1 ou 2 frases curtas, com tom natural e direto.';
   }
   if (DETAIL_REQUEST_PATTERN.test(normalized)) {
-    return 'Diretriz interna: o usuario pediu profundidade. Traga mais detalhes com clareza e sem enrolacao.';
+    return 'Resposta esperada: aprofunde com clareza e sem enrolacao.';
   }
-  return 'Diretriz interna: va direto ao ponto e evite rodeios.';
+  return 'Resposta esperada: va direto ao ponto e evite rodeios.';
 }
 
 function resolvePredictTokens(lastUserMessage: string, requestedItemCount: number | null): number {
@@ -583,12 +583,44 @@ async function createLlamaRuntimeContext(modelPath: string): Promise<RuntimeCont
           '\n\nUsuario:',
           '\nSistema:',
           '\n\nSistema:',
+          '\nsistema:',
+          '\n\nsistema:',
           '\nUser:',
           '\n\nUser:',
           '\nSystem:',
           '\n\nSystem:',
+          '\nsystem:',
+          '\n\nsystem:',
           '\nDiretriz interna:',
           '\n\nDiretriz interna:',
+          '\ndiretriz interna:',
+          '\n\ndiretriz interna:',
+          '\nInstrução:',
+          '\n\nInstrução:',
+          '\nInstrucao:',
+          '\n\nInstrucao:',
+          '\ninstrucao:',
+          '\n\ninstrucao:',
+          '\nInstrucoes internas:',
+          '\n\nInstrucoes internas:',
+          '\nInstruções internas:',
+          '\n\nInstruções internas:',
+          '\ninstrucoes internas:',
+          '\n\ninstrucoes internas:',
+          '\ninstruções internas:',
+          '\n\ninstruções internas:',
+          '\nPrompt:',
+          '\n\nPrompt:',
+          '\nprompt:',
+          '\n\nprompt:',
+          '\nResposta esperada:',
+          '\n\nResposta esperada:',
+          '\nresposta esperada:',
+          '\n\nresposta esperada:',
+          '\nVoce e o Alfa AI',
+          '\nVocê é o Alfa AI',
+          '\nvoce e o alfa ai',
+          '\nvocê é o alfa ai',
           '<|im_end|>',
           '</s>',
         ],
