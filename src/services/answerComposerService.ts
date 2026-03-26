@@ -31,20 +31,85 @@ const POLITICAL_QUERY_PATTERN =
   /\b(presidente|governador|ministro|prefeito|senador|deputado|cargo)\b/i;
 const WEB_VALIDATION_FALLBACK_NOTE =
   'Nao consegui validar isso agora pela internet, mas posso te responder com base no meu conhecimento local.';
+const HONEST_VALIDATION_FALLBACK =
+  'Nao consegui validar isso agora com seguranca. Posso tentar responder com base no conhecimento local ou voce pode reformular.';
+const COMPOSITION_INTEGRITY_FALLBACK =
+  'Nao consegui gerar uma resposta completa agora. Pode reformular para eu tentar novamente?';
+const TEMPLATE_PLACEHOLDER_PATTERN = /(\{\{[^}\n]*\}\}|\[\[[^\]\n]*\]\]|<[^>\n]*(placeholder|template|fonte|source)[^>\n]*>)/i;
+const PLACEHOLDER_SOURCE_PATTERN = /^(fonte|source|placeholder|site|link)$/i;
+const FRAGMENT_ONLY_PATTERN =
+  /^(de acordo com|segundo|com base em|em\s+[a-z\u00C0-\u017F]{3,20}\s+de\s+\d{4},?\s+o\s+[^.!?]{1,80}\s+(?:do|da|de))[.:;,\-]*$/i;
+const INCOMPLETE_ENDING_PATTERN =
+  /\b(de|do|da|dos|das|para|com|sobre|que|e|ou|em|no|na|nos|nas|por|ao|aos|a|o)\.?$/i;
 
 function normalizeText(text: string): string {
   return text.replace(/\s+$/g, '').trim();
 }
 
+function sanitizeSourceText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function isValidSource(source: MessageSource | null | undefined): source is MessageSource {
+  if (!source) {
+    return false;
+  }
+  const url = sanitizeSourceText(source.url);
+  const siteName = sanitizeSourceText(source.siteName);
+  const title = sanitizeSourceText(source.title);
+  if (!url || !/^https?:\/\//i.test(url)) {
+    return false;
+  }
+  if (!siteName || PLACEHOLDER_SOURCE_PATTERN.test(siteName.toLowerCase())) {
+    return false;
+  }
+  if (!title || PLACEHOLDER_SOURCE_PATTERN.test(title.toLowerCase())) {
+    return false;
+  }
+  return true;
+}
+
+function normalizeSources(sources: MessageSource[] | undefined): MessageSource[] {
+  if (!Array.isArray(sources) || sources.length === 0) {
+    return [];
+  }
+  const dedupe = new Set<string>();
+  const normalized: MessageSource[] = [];
+  for (const source of sources) {
+    if (!isValidSource(source)) {
+      continue;
+    }
+    const key = source.url.trim().toLowerCase();
+    if (dedupe.has(key)) {
+      continue;
+    }
+    dedupe.add(key);
+    normalized.push({
+      title: sanitizeSourceText(source.title),
+      url: sanitizeSourceText(source.url),
+      siteName: sanitizeSourceText(source.siteName),
+    });
+  }
+  return normalized;
+}
+
+export function countValidWebSources(webResult?: WebSearchResult): number {
+  return normalizeSources(webResult?.sources).length;
+}
+
+export function hasValidatedWebSources(webResult?: WebSearchResult): boolean {
+  return Boolean(webResult?.ok && countValidWebSources(webResult) > 0);
+}
+
 function sanitizeWebHonesty(
   text: string,
   decision: SearchDecision,
-  webResult?: WebSearchResult,
+  hasValidatedWeb: boolean,
 ): string {
   if (!text) {
     return '';
   }
-  if (decision === 'local_plus_web' && webResult?.ok) {
+  if (decision === 'local_plus_web' && hasValidatedWeb) {
     return text.replace(NO_INTERNET_CLAIM_PATTERN, 'com validacao factual recente');
   }
   return text.replace(WEB_ACCESS_CLAIM_PATTERN, 'considerei o contexto disponivel');
@@ -142,6 +207,59 @@ function pickBestEvidenceSnippet(query: string, webResult: WebSearchResult): str
   return snippets[0];
 }
 
+function hasTemplatePlaceholder(text: string): boolean {
+  return TEMPLATE_PLACEHOLDER_PATTERN.test(text);
+}
+
+function hasIncompleteEnding(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) {
+    return true;
+  }
+  if (/[:;,\-]\s*$/.test(normalized)) {
+    return true;
+  }
+  if (!/[.!?`)]$/.test(normalized)) {
+    return normalized.length >= 24;
+  }
+  const tail = normalized.slice(Math.max(0, normalized.length - 28));
+  return INCOMPLETE_ENDING_PATTERN.test(tail);
+}
+
+function isClearlyInvalidFragment(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) {
+    return true;
+  }
+  if (FRAGMENT_ONLY_PATTERN.test(normalized)) {
+    return true;
+  }
+  if (normalized.length <= 20 && /^(de acordo com|segundo|com base em)[\s.:;,\-]*$/i.test(normalized)) {
+    return true;
+  }
+  return false;
+}
+
+function isTextUsableForFinalAnswer(text: string, hasValidatedSources: boolean): boolean {
+  const normalized = normalizeText(text);
+  if (!normalized) {
+    return false;
+  }
+  if (!hasValidatedSources && /^(de acordo com|segundo|com base em)\b/i.test(normalized)) {
+    return false;
+  }
+  if (hasTemplatePlaceholder(normalized)) {
+    return false;
+  }
+  if (isClearlyInvalidFragment(normalized)) {
+    return false;
+  }
+  if (hasIncompleteEnding(normalized)) {
+    return false;
+  }
+  return true;
+}
+
 export function buildFastWebAnswer(query: string, webResult?: WebSearchResult): string | null {
   const normalizedQuery = normalizeText(query).toLowerCase();
   if (!normalizedQuery) {
@@ -162,7 +280,7 @@ export function buildFastWebAnswer(query: string, webResult?: WebSearchResult): 
     return `Hoje e ${ptBrDate}.`;
   }
 
-  if (!webResult?.ok) {
+  if (!hasValidatedWebSources(webResult)) {
     return null;
   }
 
@@ -178,7 +296,8 @@ export function buildPromptAugmentation(
   decision: SearchDecision,
   webResult?: WebSearchResult,
 ): PromptAugmentation {
-  if (decision === 'local_plus_web' && webResult?.ok) {
+  const hasValidatedWeb = hasValidatedWebSources(webResult);
+  if (decision === 'local_plus_web' && hasValidatedWeb && webResult) {
     return {
       externalContext: buildWebEvidenceContext(webResult),
       policyInstruction:
@@ -186,7 +305,7 @@ export function buildPromptAugmentation(
     };
   }
 
-  if (decision === 'local_plus_web' && !webResult?.ok) {
+  if (decision === 'local_plus_web' && !hasValidatedWeb) {
     return {
       policyInstruction:
         'Nao invente fatos atuais. Se faltar confianca factual, informe de forma natural que nao foi possivel validar agora.',
@@ -211,30 +330,41 @@ export function composeAnswer({
   decision,
   webResult,
 }: AnswerCompositionInput): ComposedAnswer {
-  const normalized = sanitizeWebHonesty(normalizeText(rawAnswer), decision, webResult);
+  const hasValidatedWeb = hasValidatedWebSources(webResult);
+  const normalized = sanitizeWebHonesty(normalizeText(rawAnswer), decision, hasValidatedWeb);
+  const normalizedSources = hasValidatedWeb ? normalizeSources(webResult?.sources) : [];
+  const safeLocalAnswer = isTextUsableForFinalAnswer(normalized, hasValidatedWeb) ? normalized : '';
 
   if (decision !== 'local_plus_web') {
+    const fallback = COMPOSITION_INTEGRITY_FALLBACK;
     return {
-      text: normalized,
+      text: safeLocalAnswer || fallback,
       sources: [],
       webValidationStatus: 'not_needed',
     };
   }
 
-  if (webResult?.ok) {
+  if (hasValidatedWeb && webResult) {
+    const fastWebAnswer = buildFastWebAnswer(webResult.query, webResult);
     const ensuredText =
-      normalized || buildFastWebAnswer(webResult.query, webResult) || WEB_VALIDATION_FALLBACK_NOTE;
+      safeLocalAnswer ||
+      (fastWebAnswer && isTextUsableForFinalAnswer(fastWebAnswer, true) ? fastWebAnswer : '') ||
+      COMPOSITION_INTEGRITY_FALLBACK;
     return {
       text: ensuredText,
-      sources: webResult.sources,
+      sources: normalizedSources,
       webValidationStatus: 'validated',
     };
   }
 
-  const fallbackNote = WEB_VALIDATION_FALLBACK_NOTE;
-  const textWithFallback = normalized
-    ? `${normalized}\n\n${fallbackNote}`
-    : fallbackNote;
+  if (!safeLocalAnswer || safeLocalAnswer === HONEST_VALIDATION_FALLBACK) {
+    return {
+      text: HONEST_VALIDATION_FALLBACK,
+      sources: [],
+      webValidationStatus: 'failed',
+    };
+  }
+  const textWithFallback = `${safeLocalAnswer}\n\n${WEB_VALIDATION_FALLBACK_NOTE}`;
   return {
     text: textWithFallback,
     sources: [],

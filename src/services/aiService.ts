@@ -12,7 +12,13 @@ import {
 import {loadLocalSafetyDisabled} from './safetySettingsService';
 import {classifySearchDecision, isFastWebFactQuery} from './searchDecisionService';
 import {searchWeb, WebSearchResult} from './webSearchService';
-import {buildFastWebAnswer, buildPromptAugmentation, composeAnswer} from './answerComposerService';
+import {
+  buildFastWebAnswer,
+  buildPromptAugmentation,
+  composeAnswer,
+  countValidWebSources,
+  hasValidatedWebSources,
+} from './answerComposerService';
 
 const TAG = 'AIService';
 
@@ -21,10 +27,13 @@ const TAG = 'AIService';
  */
 const STUB_RESPONSE =
   '\u2699\uFE0F Modelo local ainda nao instalado. Acesse Configuracoes para instalar o modelo Qwen2.5-3B.';
-const RUNTIME_FAILURE_FALLBACK =
-  'Falha ao carregar o runtime local. Veja os logs.';
 const OUTPUT_SANITIZATION_FALLBACK =
   'Nao consegui gerar uma resposta segura agora. Tente reformular sua pergunta.';
+const HONEST_VALIDATION_FALLBACK =
+  'Nao consegui validar isso agora com seguranca. Posso tentar responder com base no conhecimento local ou voce pode reformular.';
+const TEMPLATE_PLACEHOLDER_PATTERN = /(\{\{[^}\n]*\}\}|\[\[[^\]\n]*\]\]|<[^>\n]*(placeholder|template|fonte|source)[^>\n]*>)/i;
+const FRAGMENT_ONLY_PATTERN =
+  /^(de acordo com|segundo|com base em|em\s+[a-z\u00C0-\u017F]{3,20}\s+de\s+\d{4},?\s+o\s+[^.!?]{1,80}\s+(?:do|da|de))[.:;,\-]*$/i;
 const CASUAL_SHORT_REPLY_PATTERN =
   /^(oi+|ol[áa]+|opa+|e ai+|bom dia|boa tarde|boa noite|tudo bem|beleza|blz|valeu|obrigad[oa]|que maluquice.*|que doidera.*)[!.?\s]*$/i;
 const DETAIL_REQUEST_PATTERN =
@@ -469,6 +478,25 @@ function buildCasualSafetyFallback(lastUserContent: string): string {
   return OUTPUT_SANITIZATION_FALLBACK;
 }
 
+function resolveRobustFallbackResponse(
+  decision: SearchDecision,
+  query: string,
+  lastUserContent: string,
+  webResult?: WebSearchResult,
+): string {
+  if (decision === 'local_plus_web') {
+    const validatedWebAnswer = query ? buildFastWebAnswer(query, webResult) : null;
+    if (validatedWebAnswer) {
+      return validatedWebAnswer;
+    }
+    if (!hasValidatedWebSources(webResult)) {
+      return HONEST_VALIDATION_FALLBACK;
+    }
+    return OUTPUT_SANITIZATION_FALLBACK;
+  }
+  return buildCasualSafetyFallback(lastUserContent);
+}
+
 function hasUnclosedCodeFence(content: string): boolean {
   const fences = content.match(/```/g);
   return Boolean(fences && fences.length % 2 !== 0);
@@ -487,6 +515,38 @@ function isLikelyTruncatedEnding(content: string): boolean {
   }
   const tail = normalized.slice(Math.max(0, normalized.length - 24));
   return INCOMPLETE_ENDING_PATTERN.test(tail);
+}
+
+function hasTemplatePlaceholder(content: string): boolean {
+  return TEMPLATE_PLACEHOLDER_PATTERN.test(content);
+}
+
+function isClearlyInvalidFragment(content: string): boolean {
+  const normalized = content.trim();
+  if (!normalized) {
+    return true;
+  }
+  if (FRAGMENT_ONLY_PATTERN.test(normalized)) {
+    return true;
+  }
+  if (normalized.length <= 20 && /^(de acordo com|segundo|com base em)[\s.:;,\-]*$/i.test(normalized)) {
+    return true;
+  }
+  return false;
+}
+
+function isStructurallyInvalidResponse(content: string): boolean {
+  const normalized = content.trim();
+  if (!normalized) {
+    return true;
+  }
+  if (hasTemplatePlaceholder(normalized)) {
+    return true;
+  }
+  if (isClearlyInvalidFragment(normalized)) {
+    return true;
+  }
+  return isLikelyTruncatedEnding(normalized);
 }
 
 function ensureNaturalResponseEnding(response: string): string {
@@ -515,6 +575,8 @@ function buildFinalResponse(rawResponse: string, lastUserContent: string): strin
   if (!normalizedResponse) {
     return '';
   }
+  const recoveredFromFull =
+    normalizeModelResponse(ensureNaturalResponseEnding(normalizedResponse));
   const conciseResponse = keepBriefPromptReplyConcise(
     keepShortQuestionReplyConcise(
       keepCasualReplyConcise(normalizedResponse, lastUserContent),
@@ -524,13 +586,13 @@ function buildFinalResponse(rawResponse: string, lastUserContent: string): strin
   );
   const finalized = normalizeModelResponse(ensureNaturalResponseEnding(conciseResponse));
   if (!finalized) {
-    return normalizeModelResponse(ensureNaturalResponseEnding(normalizedResponse));
+    return !isStructurallyInvalidResponse(recoveredFromFull) ? recoveredFromFull : '';
   }
-  if (
-    isLikelyTruncatedEnding(finalized) &&
-    normalizedResponse.length >= finalized.length + 36
-  ) {
-    return normalizeModelResponse(ensureNaturalResponseEnding(normalizedResponse));
+  if (isStructurallyInvalidResponse(finalized)) {
+    if (!isStructurallyInvalidResponse(recoveredFromFull)) {
+      return recoveredFromFull;
+    }
+    return '';
   }
   return finalized;
 }
@@ -611,6 +673,7 @@ export async function generateResponsePackageStream(
   const localSafetyDisabled = await loadLocalSafetyDisabled();
   const lastMessage = messages[messages.length - 1];
   const decisionResult = classifySearchDecision(messages);
+  const lastUserContent = getLastUserContent(messages);
   logInfo(
     TAG,
     `Entrada no AIService.generateResponsePackage com ${messages.length} mensagem(ns)`,
@@ -650,24 +713,38 @@ export async function generateResponsePackageStream(
     const quickWebAttempt = await waitPromiseWithTimeout(webSearchPromise, FAST_WEB_FIRST_WAIT_MS);
     if (!quickWebAttempt.timedOut) {
       webResult = quickWebAttempt.value;
-      const quickAnswer = buildFastWebAnswer(decisionResult.query, webResult);
-      if (quickAnswer) {
-        const composedQuick = composeAnswer({
-          rawAnswer: quickAnswer,
-          decision: decisionResult.decision,
-          webResult,
-        });
-        logInfo(
+      const validWebSourceCount = countValidWebSources(webResult);
+      if (!hasValidatedWebSources(webResult)) {
+        logWarn(
           TAG,
-          'Fast path web concluido sem inferencia local',
-          `query=${decisionResult.query}\nfontes=${composedQuick.sources.length}`,
+          'Fast path web rejeitado por falta de fontes validas',
+          `query=${decisionResult.query}\nwebOk=${Boolean(webResult?.ok)}\nevidences=${webResult?.evidences.length ?? 0}\nfontesValidas=${validWebSourceCount}`,
         );
-        return {
-          text: composedQuick.text,
-          sources: composedQuick.sources,
-          searchDecision: decisionResult.decision,
-          webValidationStatus: composedQuick.webValidationStatus,
-        };
+      } else {
+        const quickAnswer = buildFastWebAnswer(decisionResult.query, webResult);
+        if (quickAnswer) {
+          const composedQuick = composeAnswer({
+            rawAnswer: quickAnswer,
+            decision: decisionResult.decision,
+            webResult,
+          });
+          logInfo(
+            TAG,
+            'Fast path web aceito sem inferencia local',
+            `query=${decisionResult.query}\nfontesValidas=${composedQuick.sources.length}`,
+          );
+          return {
+            text: composedQuick.text,
+            sources: composedQuick.sources,
+            searchDecision: decisionResult.decision,
+            webValidationStatus: composedQuick.webValidationStatus,
+          };
+        }
+        logWarn(
+          TAG,
+          'Fast path web rejeitado por resposta incompleta/sem resposta',
+          `query=${decisionResult.query}\nfontesValidas=${validWebSourceCount}`,
+        );
       }
     } else {
       logWarn(
@@ -684,12 +761,22 @@ export async function generateResponsePackageStream(
     logInfo(TAG, 'Checagem de runtime/modelo concluida', `Runtime pronto: ${runtimeReady}`);
   } catch (error) {
     logError(TAG, 'Erro ao checar/carregar runtime', toErrorDetails(error));
+    const fallback = resolveRobustFallbackResponse(
+      decisionResult.decision,
+      decisionResult.query,
+      lastUserContent,
+      webResult,
+    );
+    const fallbackComposed = composeAnswer({
+      rawAnswer: fallback,
+      decision: decisionResult.decision,
+      webResult,
+    });
     return {
-      text: RUNTIME_FAILURE_FALLBACK,
-      sources: [],
+      text: fallbackComposed.text,
+      sources: fallbackComposed.sources,
       searchDecision: decisionResult.decision,
-      webValidationStatus:
-        decisionResult.decision === 'local_plus_web' ? 'failed' : 'not_needed',
+      webValidationStatus: fallbackComposed.webValidationStatus,
     };
   }
 
@@ -711,12 +798,22 @@ export async function generateResponsePackageStream(
       };
     }
     logWarn(TAG, 'Runtime indisponivel, fallback de falha de runtime', detail);
+    const fallback = resolveRobustFallbackResponse(
+      decisionResult.decision,
+      decisionResult.query,
+      lastUserContent,
+      webResult,
+    );
+    const fallbackComposed = composeAnswer({
+      rawAnswer: fallback,
+      decision: decisionResult.decision,
+      webResult,
+    });
     return {
-      text: RUNTIME_FAILURE_FALLBACK,
-      sources: [],
+      text: fallbackComposed.text,
+      sources: fallbackComposed.sources,
       searchDecision: decisionResult.decision,
-      webValidationStatus:
-        decisionResult.decision === 'local_plus_web' ? 'failed' : 'not_needed',
+      webValidationStatus: fallbackComposed.webValidationStatus,
     };
   }
 
@@ -732,6 +829,13 @@ export async function generateResponsePackageStream(
           `query=${decisionResult.query}`,
         );
       }
+    }
+    if (webResult?.ok && !hasValidatedWebSources(webResult)) {
+      logWarn(
+        TAG,
+        'Resposta web descartada por falta de fontes validas',
+        `query=${decisionResult.query}\nevidences=${webResult.evidences.length}\nfontesValidas=${countValidWebSources(webResult)}`,
+      );
     }
 
     const augmentation = buildPromptAugmentation(decisionResult.decision, webResult);
@@ -760,26 +864,50 @@ export async function generateResponsePackageStream(
         'Inferencia retornou valor invalido (nao string), aplicando fallback',
         `Tipo retornado: ${typeof response}`,
       );
+      const fallback = resolveRobustFallbackResponse(
+        decisionResult.decision,
+        decisionResult.query,
+        lastUserContent,
+        webResult,
+      );
+      const fallbackComposed = composeAnswer({
+        rawAnswer: fallback,
+        decision: decisionResult.decision,
+        webResult,
+      });
       return {
-        text: RUNTIME_FAILURE_FALLBACK,
-        sources: [],
+        text: fallbackComposed.text,
+        sources: fallbackComposed.sources,
         searchDecision: decisionResult.decision,
-        webValidationStatus:
-          decisionResult.decision === 'local_plus_web' ? 'failed' : 'not_needed',
+        webValidationStatus: fallbackComposed.webValidationStatus,
       };
     }
     const baseResponse = localSafetyDisabled
       ? ensureNaturalResponseEnding(response.trim())
-      : buildFinalResponse(response, getLastUserContent(messages));
+      : buildFinalResponse(response, lastUserContent);
     if (localSafetyDisabled) {
-      if (!baseResponse) {
-        logWarn(TAG, 'Resposta vazia com modo de teste ativo, aplicando fallback de runtime');
+      if (!baseResponse || isStructurallyInvalidResponse(baseResponse)) {
+        logWarn(
+          TAG,
+          'Resposta descartada por estar truncada/invalida com modo de teste ativo',
+          `tamanho=${baseResponse.length}\nquery=${decisionResult.query}`,
+        );
+        const fallback = resolveRobustFallbackResponse(
+          decisionResult.decision,
+          decisionResult.query,
+          lastUserContent,
+          webResult,
+        );
+        const fallbackComposed = composeAnswer({
+          rawAnswer: fallback,
+          decision: decisionResult.decision,
+          webResult,
+        });
         return {
-          text: RUNTIME_FAILURE_FALLBACK,
-          sources: [],
+          text: fallbackComposed.text,
+          sources: fallbackComposed.sources,
           searchDecision: decisionResult.decision,
-          webValidationStatus:
-            decisionResult.decision === 'local_plus_web' ? 'failed' : 'not_needed',
+          webValidationStatus: fallbackComposed.webValidationStatus,
         };
       }
       logInfo(
@@ -800,8 +928,41 @@ export async function generateResponsePackageStream(
       };
     }
     if (!baseResponse.trim()) {
-      logWarn(TAG, 'Resposta descartada por sanitizacao/empty output, aplicando fallback seguro');
-      const fallback = buildCasualSafetyFallback(getLastUserContent(messages));
+      logWarn(
+        TAG,
+        'Fallback acionado por texto vazio apos inferencia local',
+        `query=${decisionResult.query}`,
+      );
+      const fallback = resolveRobustFallbackResponse(
+        decisionResult.decision,
+        decisionResult.query,
+        lastUserContent,
+        webResult,
+      );
+      const composedFallback = composeAnswer({
+        rawAnswer: fallback,
+        decision: decisionResult.decision,
+        webResult,
+      });
+      return {
+        text: composedFallback.text,
+        sources: composedFallback.sources,
+        searchDecision: decisionResult.decision,
+        webValidationStatus: composedFallback.webValidationStatus,
+      };
+    }
+    if (isStructurallyInvalidResponse(baseResponse)) {
+      logWarn(
+        TAG,
+        'Resposta descartada por estar truncada/invalida',
+        `query=${decisionResult.query}\ntamanho=${baseResponse.length}`,
+      );
+      const fallback = resolveRobustFallbackResponse(
+        decisionResult.decision,
+        decisionResult.query,
+        lastUserContent,
+        webResult,
+      );
       const composedFallback = composeAnswer({
         rawAnswer: fallback,
         decision: decisionResult.decision,
@@ -832,14 +993,36 @@ export async function generateResponsePackageStream(
     };
   } catch (error) {
     logError(TAG, 'Falha na inferencia local, aplicando fallback seguro', toErrorDetails(error));
+    const isEmptyInference =
+      error instanceof Error && /texto vazio|null\/undefined|nulo\/indefinido/i.test(error.message);
+    if (isEmptyInference) {
+      logWarn(
+        TAG,
+        'Fallback acionado por texto vazio na inferencia local',
+        `query=${decisionResult.query}`,
+      );
+    }
     if (!webResult && webSearchPromise) {
       const webRecovery = await waitPromiseWithTimeout(webSearchPromise, WEB_RESULT_RECOVERY_WAIT_MS);
       if (!webRecovery.timedOut) {
         webResult = webRecovery.value;
       }
     }
+    if (webResult?.ok && !hasValidatedWebSources(webResult)) {
+      logWarn(
+        TAG,
+        'Resposta web descartada por falta de fontes validas durante recuperacao',
+        `query=${decisionResult.query}\nevidences=${webResult.evidences.length}\nfontesValidas=${countValidWebSources(webResult)}`,
+      );
+    }
+    const fallback = resolveRobustFallbackResponse(
+      decisionResult.decision,
+      decisionResult.query,
+      lastUserContent,
+      webResult,
+    );
     const fallbackComposed = composeAnswer({
-      rawAnswer: RUNTIME_FAILURE_FALLBACK,
+      rawAnswer: fallback,
       decision: decisionResult.decision,
       webResult,
     });

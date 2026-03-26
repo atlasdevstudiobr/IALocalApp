@@ -12,6 +12,8 @@ const STRONG_WEB_PATTERNS: RegExp[] = [
   /\b(clima|temperatura|chuva|previs[a\u00E3]o do tempo)\b/i,
   /\b(cota[c\u00E7][a\u00E3]o|pre[c\u00E7]o|d[o\u00F3]lar|bitcoin|btc|euro|ibovespa|selic)\b/i,
   /\b(presidente|governador|ministro|prefeito|senador|deputado|cargo atual)\b/i,
+  /\b(idade atual|quantos anos tem|idade de)\b/i,
+  /\b(ceo atual|quem ocupa o cargo|mandato atual)\b/i,
   /\b(capital da|capital do)\b/i,
   /\b(lei|regra|regulamento|norma|decreto|portaria)\b/i,
   /\b(data de hoje|que dia e hoje|que ano estamos|ano atual)\b/i,
@@ -19,6 +21,7 @@ const STRONG_WEB_PATTERNS: RegExp[] = [
 const FAST_FACT_PATTERNS: RegExp[] = [
   /\b(que ano estamos|ano atual|em que ano estamos|data de hoje|qual a data de hoje|que dia e hoje)\b/i,
   /\b(quem [e\u00E9] o (?:atual )?(?:presidente|governador|prefeito|ministro|senador|deputado)|(?:atual\s+)?(?:presidente|governador|prefeito|ministro|senador|deputado)\s+(?:do|da|de)|presidente do brasil|cargo politico atual)\b/i,
+  /\b(idade atual|quantos anos tem|idade de)\b/i,
   /\b(quanto est[a\u00E1] o d[o\u00F3]lar|cota[c\u00E7][a\u00E3]o do d[o\u00F3]lar|d[o\u00F3]lar hoje|euro hoje|bitcoin hoje|btc hoje)\b/i,
   /\b(clima|temperatura|previs[a\u00E3]o do tempo|tempo em)\b/i,
   /\b(capital da|capital do)\b/i,

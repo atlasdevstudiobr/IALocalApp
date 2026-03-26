@@ -463,6 +463,28 @@ async function searchWebInternal(
     const sources = buildSourceAttributions(rawCandidates, maxSources);
     logInfo(
       TAG,
+      'Quantidade real de fontes validas apos parse',
+      `query=${normalizedQuery}\nmode=${mode}\nfontesValidas=${sources.length}`,
+    );
+    if (sources.length === 0) {
+      logWarn(
+        TAG,
+        'Resposta web descartada por falta de fontes validas',
+        `query=${normalizedQuery}\nmode=${mode}\nevidences=${evidences.length}`,
+      );
+      return {
+        ok: false,
+        query: normalizedQuery,
+        mode,
+        fetchedAtIso,
+        durationMs: Date.now() - startedAt,
+        evidences,
+        sources: [],
+        errorMessage: 'sem_fontes_validas',
+      };
+    }
+    logInfo(
+      TAG,
       'Busca web concluida',
       `query=${normalizedQuery}\nmode=${mode}\nevidences=${evidences.length}\nsources=${sources.length}\ndurationMs=${
         Date.now() - startedAt
@@ -504,6 +526,28 @@ async function searchWebInternal(
         url: item.url,
       }));
       const sources = buildSourceAttributions(rawCandidates, maxSources);
+      logInfo(
+        TAG,
+        'Quantidade real de fontes validas apos parse',
+        `query=${normalizedQuery}\nmode=${mode}\nfontesValidas=${sources.length}`,
+      );
+      if (sources.length === 0) {
+        logWarn(
+          TAG,
+          'Resposta web descartada por falta de fontes validas',
+          `query=${normalizedQuery}\nmode=${mode}\nevidences=${googleFallbackEvidences.length}`,
+        );
+        return {
+          ok: false,
+          query: normalizedQuery,
+          mode,
+          fetchedAtIso,
+          durationMs: Date.now() - startedAt,
+          evidences: googleFallbackEvidences,
+          sources: [],
+          errorMessage: 'sem_fontes_validas',
+        };
+      }
       return {
         ok: true,
         query: normalizedQuery,
