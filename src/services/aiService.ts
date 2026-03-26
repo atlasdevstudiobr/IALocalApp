@@ -126,7 +126,8 @@ export async function generateResponse(messages: Message[]): Promise<string> {
     const detail = `Status runtime: ${state.status}\nMotivo: ${
       state.errorMessage ?? 'modelo nao carregado'
     }`;
-    if (state.status === 'not_loaded') {
+    const modelUnavailable = state.status === 'not_loaded' && !state.modelPath;
+    if (modelUnavailable) {
       logWarn(TAG, 'Runtime indisponivel por modelo nao carregado, fallback de modelo', detail);
       return STUB_RESPONSE;
     }

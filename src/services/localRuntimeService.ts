@@ -1,7 +1,14 @@
+import {NativeModules} from 'react-native';
+import {initLlama, releaseAllLlama, type LlamaContext} from 'llama.rn';
 import {Message} from '../types';
 import * as LogService from './logService';
 
 const TAG = 'LocalRuntimeService';
+const EXPLICIT_RUNTIME_ENGINE = 'llama.rn';
+const EXPLICIT_RUNTIME_STRATEGY = 'static-import';
+
+const DEFAULT_CONTEXT_SIZE = 2048;
+const DEFAULT_PREDICT_TOKENS = 384;
 
 export type RuntimeStatus = 'not_loaded' | 'loading' | 'ready' | 'error';
 
@@ -17,11 +24,6 @@ interface RuntimeContext {
   release?: () => Promise<void> | void;
 }
 
-interface RuntimeAdapter {
-  engine: string;
-  createContext: (modelPath: string) => Promise<RuntimeContext>;
-}
-
 interface ModelDownloadStateSnapshot {
   status: 'not_downloaded' | 'downloading' | 'ready' | 'error';
   filePath?: string;
@@ -29,20 +31,10 @@ interface ModelDownloadStateSnapshot {
 
 type ModelDownloadStateLoader = () => Promise<ModelDownloadStateSnapshot>;
 
-type MetroRequire = {
-  (moduleId: number): unknown;
-  resolveWeak?: (moduleName: string) => number;
-};
-
-const DEFAULT_CONTEXT_SIZE = 2048;
-const DEFAULT_PREDICT_TOKENS = 384;
-
 let runtimeState: RuntimeState = {status: 'not_loaded'};
 let runtimeContext: RuntimeContext | null = null;
 let runtimeLoadPromise: Promise<boolean> | null = null;
 let modelDownloadStateLoader: ModelDownloadStateLoader | null = null;
-const optionalRuntimeModuleErrorLogCache = new Set<string>();
-const optionalRuntimeModuleSkipLogCache = new Set<string>();
 
 function logInfo(tag: string, message: string, details?: string): void {
   try {
@@ -92,20 +84,17 @@ function toErrorDetails(error: unknown): string {
 }
 
 function normalizeRuntimeErrorMessage(message: string): string {
-  if (message.includes('Requiring unknown module "undefined"')) {
-    return 'Bridge JS do runtime nao resolvido (dependencia opcional ausente ou link quebrado).';
+  if (
+    message.includes("Cannot read property 'initContext' of null") ||
+    message.includes("Cannot read properties of null (reading 'initContext')")
+  ) {
+    return 'Bridge nativo RNLlama nao encontrado. Rebuild nativo necessario apos instalar/autolink do llama.rn.';
   }
   if (
-    message.includes("Cannot read property 'loadModelDownloadState' of undefined") ||
-    message.includes("Cannot read properties of undefined (reading 'loadModelDownloadState')")
+    message.includes("Cannot read property 'completion' of undefined") ||
+    message.includes("Cannot read properties of undefined (reading 'completion')")
   ) {
-    return 'Ligacao com ModelDownloadService invalida (loader de estado nao registrado).';
-  }
-  if (
-    message.includes("Cannot read property 'logInfo' of undefined") ||
-    message.includes("Cannot read properties of undefined (reading 'logInfo')")
-  ) {
-    return 'Logger interno do runtime veio indefinido (integracao JS/nativa inconsistente).';
+    return 'Contexto do llama.rn veio invalido (completion indisponivel).';
   }
   return message;
 }
@@ -114,67 +103,24 @@ function normalizeRuntimeErrorDetails(error: unknown): string {
   return normalizeRuntimeErrorMessage(toErrorDetails(error));
 }
 
-function reportOptionalRuntimeModuleSkip(
-  engine: string,
-  packageName: string,
-  reason: string,
-): void {
-  const cacheKey = `${engine}:${packageName}:${reason}`;
-  if (optionalRuntimeModuleSkipLogCache.has(cacheKey)) {
-    return;
-  }
-  optionalRuntimeModuleSkipLogCache.add(cacheKey);
-  logInfo(
-    TAG,
-    'Adapter opcional de runtime ignorado',
-    `Engine: ${engine}\nPacote: ${packageName}\nMotivo: ${reason}`,
-  );
+function loadNativeRNLlamaModule(): unknown | null {
+  const modules = NativeModules as Record<string, unknown>;
+  return modules.RNLlama ?? null;
 }
 
-function reportOptionalRuntimeRequireFailure(
-  engine: string,
-  packageName: string,
-  error: unknown,
-): void {
-  const cacheKey = `${engine}:${packageName}`;
-  if (optionalRuntimeModuleErrorLogCache.has(cacheKey)) {
-    return;
-  }
-  optionalRuntimeModuleErrorLogCache.add(cacheKey);
-  logWarn(
-    TAG,
-    'Require opcional de runtime falhou',
-    `Engine: ${engine}\nPacote: ${packageName}\nMotivo: ${normalizeRuntimeErrorDetails(error)}`,
-  );
+function isNativeRNLlamaModuleAvailable(): boolean {
+  return loadNativeRNLlamaModule() !== null;
 }
 
-function isNewArchitectureEnabled(): boolean {
-  const scope = globalThis as {__turboModuleProxy?: unknown};
-  return typeof scope.__turboModuleProxy === 'function';
+function buildNativeBridgeUnavailableReason(): string {
+  return 'Runtime explicito selecionado (llama.rn), mas NativeModules.RNLlama esta ausente. Rebuild do app necessario para carregar o bridge nativo.';
 }
 
-function resolveOptionalRuntimeModule(engine: string, packageName: string): unknown | null {
-  const metroRequire = require as MetroRequire;
-  if (typeof metroRequire.resolveWeak !== 'function') {
-    reportOptionalRuntimeModuleSkip(engine, packageName, 'resolveWeak indisponivel no runtime JS');
-    return null;
+function normalizeModelPath(modelPath: string): string {
+  if (modelPath.startsWith('file://')) {
+    return modelPath;
   }
-
-  try {
-    const moduleId = metroRequire.resolveWeak(packageName);
-    if (typeof moduleId !== 'number') {
-      reportOptionalRuntimeModuleSkip(
-        engine,
-        packageName,
-        `moduleId invalido retornado pelo bundler: ${String(moduleId)}`,
-      );
-      return null;
-    }
-    return metroRequire(moduleId);
-  } catch (error) {
-    reportOptionalRuntimeRequireFailure(engine, packageName, error);
-    return null;
-  }
+  return `file://${modelPath}`;
 }
 
 async function loadModelDownloadStateFromLoader(): Promise<ModelDownloadStateSnapshot> {
@@ -207,142 +153,39 @@ function buildPrompt(messages: Message[]): string {
   return `${prompt}\n\nAssistente:`;
 }
 
-function getLlamaRnAdapter(): RuntimeAdapter | null {
-  if (!isNewArchitectureEnabled()) {
-    reportOptionalRuntimeModuleSkip(
-      'llama.rn',
-      'llama.rn',
-      'New Architecture desativada; adapter requer __turboModuleProxy',
-    );
-    return null;
-  }
+async function createLlamaRuntimeContext(modelPath: string): Promise<RuntimeContext> {
+  const runtimeModelPath = normalizeModelPath(modelPath);
 
-  const llamaRnModule = resolveOptionalRuntimeModule('llama.rn', 'llama.rn');
-  if (!llamaRnModule) {
-    return null;
-  }
-
-  try {
-    const llamaRn = llamaRnModule as {
-      initLlama?: (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
-      releaseAllLlama?: () => Promise<void>;
-    };
-
-    if (typeof llamaRn.initLlama !== 'function') {
-      return null;
-    }
-    const initLlama = llamaRn.initLlama;
-
-    return {
-      engine: 'llama.rn',
-      createContext: async (modelPath: string) => {
-        const ctx = (await initLlama({
-          model: modelPath,
-          n_ctx: DEFAULT_CONTEXT_SIZE,
-        })) as {
-          completion?: (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
-          release?: () => Promise<void>;
-        };
-
-        if (typeof ctx.completion !== 'function') {
-          throw new Error('llama.rn sem metodo completion');
-        }
-        const completionFn = ctx.completion;
-
-        return {
-          infer: async (prompt: string, nPredict: number) => {
-            const completion = await completionFn({
-              prompt,
-              n_predict: nPredict,
-              temperature: 0.7,
-            });
-            const text = completion?.text;
-            return typeof text === 'string' ? text.trim() : '';
-          },
-          release: async () => {
-            if (typeof ctx.release === 'function') {
-              await ctx.release();
-              return;
-            }
-            if (typeof llamaRn.releaseAllLlama === 'function') {
-              await llamaRn.releaseAllLlama();
-            }
-          },
-        };
-      },
-    };
-  } catch (error) {
-    reportOptionalRuntimeRequireFailure('llama.rn', 'llama.rn', error);
-    return null;
-  }
-}
-
-function getReactNativeLlamaAdapter(): RuntimeAdapter | null {
-  const reactNativeLlamaModule = resolveOptionalRuntimeModule(
-    'react-native-llama',
-    'react-native-llama',
+  logInfo(
+    TAG,
+    'Tentativa de criar contexto do runtime iniciada',
+    `Engine: ${EXPLICIT_RUNTIME_ENGINE}\nModelo: ${runtimeModelPath}`,
   );
-  if (!reactNativeLlamaModule) {
-    return null;
+
+  const context = (await initLlama({
+    model: runtimeModelPath,
+    n_ctx: DEFAULT_CONTEXT_SIZE,
+  })) as LlamaContext;
+
+  if (!context || typeof context.completion !== 'function') {
+    throw new Error('llama.rn sem metodo completion');
   }
 
-  try {
-    const reactNativeLlama = reactNativeLlamaModule as {
-      LlamaContext?: {
-        create?: (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
-      };
-    };
+  return {
+    infer: async (prompt: string, nPredict: number) => {
+      const completion = (await context.completion({
+        prompt,
+        n_predict: nPredict,
+        temperature: 0.7,
+      })) as {text?: unknown};
 
-    const create = reactNativeLlama.LlamaContext?.create;
-    if (typeof create !== 'function') {
-      return null;
-    }
-
-    return {
-      engine: 'react-native-llama',
-      createContext: async (modelPath: string) => {
-        const ctx = (await create({
-          model: modelPath,
-          n_ctx: DEFAULT_CONTEXT_SIZE,
-        })) as {
-          completion?: (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
-          release?: () => Promise<void>;
-        };
-
-        if (typeof ctx.completion !== 'function') {
-          throw new Error('react-native-llama sem metodo completion');
-        }
-        const completionFn = ctx.completion;
-
-        return {
-          infer: async (prompt: string, nPredict: number) => {
-            const completion = await completionFn({
-              prompt,
-              n_predict: nPredict,
-              temperature: 0.7,
-            });
-            const text = completion?.text;
-            return typeof text === 'string' ? text.trim() : '';
-          },
-          release: async () => {
-            await ctx.release?.();
-          },
-        };
-      },
-    };
-  } catch (error) {
-    reportOptionalRuntimeRequireFailure(
-      'react-native-llama',
-      'react-native-llama',
-      error,
-    );
-    return null;
-  }
-}
-
-function resolveRuntimeAdapters(): RuntimeAdapter[] {
-  const adapters = [getLlamaRnAdapter(), getReactNativeLlamaAdapter()];
-  return adapters.filter((adapter): adapter is RuntimeAdapter => adapter !== null);
+      const text = completion?.text;
+      return typeof text === 'string' ? text.trim() : '';
+    },
+    release: async () => {
+      await context.release();
+    },
+  };
 }
 
 export function getRuntimeState(): RuntimeState {
@@ -366,19 +209,31 @@ export async function ensureRuntimeReady(): Promise<boolean> {
   }
 
   runtimeLoadPromise = (async () => {
-    runtimeState = {status: 'loading'};
-    logInfo(TAG, 'Tentativa de carregar runtime local iniciada');
+    runtimeState = {
+      status: 'loading',
+      engine: EXPLICIT_RUNTIME_ENGINE,
+    };
+    logInfo(
+      TAG,
+      'Tentativa de carregar runtime local iniciada',
+      `Engine selecionado: ${EXPLICIT_RUNTIME_ENGINE}\nEstrategia: ${EXPLICIT_RUNTIME_STRATEGY}`,
+    );
+
+    let resolvedModelPath: string | undefined;
 
     try {
       logInfo(TAG, 'Checagem de modelo instalado iniciada');
       const modelState = await loadModelDownloadStateFromLoader();
+      resolvedModelPath = modelState.filePath;
       logInfo(
         TAG,
         'Checagem de modelo instalado concluida',
         `Status: ${modelState.status}\nPath: ${modelState.filePath ?? 'indisponivel'}`,
       );
+
       if (modelState.status !== 'ready' || !modelState.filePath) {
         runtimeState = {status: 'not_loaded'};
+        runtimeContext = null;
         logWarn(
           TAG,
           'Runtime nao carregado: modelo indisponivel',
@@ -387,64 +242,37 @@ export async function ensureRuntimeReady(): Promise<boolean> {
         return false;
       }
 
-      const adapters = resolveRuntimeAdapters();
-      if (adapters.length === 0) {
+      if (!isNativeRNLlamaModuleAvailable()) {
+        const reason = buildNativeBridgeUnavailableReason();
         runtimeState = {
-          status: 'error',
+          status: 'not_loaded',
           modelPath: modelState.filePath,
-          errorMessage: 'Nenhum runtime local compativel encontrado',
+          engine: EXPLICIT_RUNTIME_ENGINE,
+          errorMessage: reason,
         };
-        logError(TAG, 'Falha ao carregar runtime', runtimeState.errorMessage);
+        runtimeContext = null;
+        logWarn(TAG, 'Runtime explicito indisponivel', reason);
         return false;
       }
 
-      const adapterErrors: string[] = [];
-      for (const adapter of adapters) {
-        logInfo(
-          TAG,
-          'Tentativa de criar contexto do runtime iniciada',
-          `Engine: ${adapter.engine}\nModelo: ${modelState.filePath}`,
-        );
-
-        try {
-          runtimeContext = await adapter.createContext(modelState.filePath);
-          logInfo(TAG, 'Tentativa de criar contexto do runtime concluida com sucesso');
-          runtimeState = {
-            status: 'ready',
-            modelPath: modelState.filePath,
-            engine: adapter.engine,
-          };
-          logInfo(
-            TAG,
-            'Runtime local carregado com sucesso',
-            `Engine: ${adapter.engine}\nModelo: ${modelState.filePath}`,
-          );
-          return true;
-        } catch (adapterError) {
-          runtimeContext = null;
-          const normalizedMessage = normalizeRuntimeErrorMessage(
-            toErrorMessage(adapterError),
-          );
-          adapterErrors.push(`${adapter.engine}: ${normalizedMessage}`);
-          logWarn(
-            TAG,
-            'Falha ao inicializar adapter de runtime; tentando proximo',
-            `Engine: ${adapter.engine}\nMotivo: ${normalizeRuntimeErrorDetails(adapterError)}`,
-          );
-        }
-      }
-
+      runtimeContext = await createLlamaRuntimeContext(modelState.filePath);
       runtimeState = {
-        status: 'error',
+        status: 'ready',
         modelPath: modelState.filePath,
-        errorMessage: `Nenhum adapter de runtime inicializou com sucesso.\n${adapterErrors.join('\n')}`,
+        engine: EXPLICIT_RUNTIME_ENGINE,
       };
-      logError(TAG, 'Falha ao carregar runtime', runtimeState.errorMessage);
-      return false;
+      logInfo(
+        TAG,
+        'Runtime local carregado com sucesso',
+        `Engine: ${EXPLICIT_RUNTIME_ENGINE}\nModelo: ${modelState.filePath}`,
+      );
+      return true;
     } catch (error) {
       const errorMessage = normalizeRuntimeErrorMessage(toErrorMessage(error));
       runtimeState = {
         status: 'error',
+        modelPath: resolvedModelPath,
+        engine: EXPLICIT_RUNTIME_ENGINE,
         errorMessage,
       };
       runtimeContext = null;
@@ -452,7 +280,11 @@ export async function ensureRuntimeReady(): Promise<boolean> {
       return false;
     } finally {
       runtimeLoadPromise = null;
-      logInfo(TAG, 'Fluxo de carregamento de runtime finalizado', `Status final: ${runtimeState.status}`);
+      logInfo(
+        TAG,
+        'Fluxo de carregamento de runtime finalizado',
+        `Status final: ${runtimeState.status}\nEngine: ${runtimeState.engine ?? 'indisponivel'}`,
+      );
     }
   })();
 
@@ -493,6 +325,7 @@ export async function releaseRuntime(): Promise<void> {
 
   try {
     await runtimeContext.release?.();
+    await releaseAllLlama();
   } catch (error) {
     logWarn(TAG, 'Falha ao liberar runtime', toErrorMessage(error));
   } finally {
