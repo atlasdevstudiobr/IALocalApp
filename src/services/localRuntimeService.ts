@@ -11,13 +11,39 @@ const EXPLICIT_RUNTIME_STRATEGY = 'static-import';
 
 const DEFAULT_CONTEXT_SIZE = 1024;
 const DEFAULT_BATCH_SIZE = 128;
-const DEFAULT_PREDICT_TOKENS = 192;
-const MAX_PROMPT_MESSAGES = 12;
-const MAX_PROMPT_CHARS = 8000;
+const DEFAULT_PREDICT_TOKENS = 128;
+const MIN_PREDICT_TOKENS = 56;
+const MAX_PREDICT_TOKENS = 192;
+const MAX_PROMPT_MESSAGES = 10;
+const MAX_PROMPT_CONTEXT_CHARS = 2800;
+const MAX_PROMPT_CHARS = 3600;
+const MAX_PROMPT_MESSAGE_CHARS = 1200;
+const INFERENCE_TEMPERATURE = 0.62;
+const INFERENCE_TOP_P = 0.88;
+const INFERENCE_TOP_K = 40;
+const INFERENCE_PENALTY_REPEAT = 1.12;
+const INFERENCE_PENALTY_LAST_N = 96;
 const MIN_ANDROID_TOTAL_RAM_KB = 5 * 1024 * 1024;
 const KNOWN_UNSUPPORTED_SOC_MARKERS = ['sm7450'];
 const CPU_INFO_PATH = '/proc/cpuinfo';
 const MEM_INFO_PATH = '/proc/meminfo';
+const LOCAL_SYSTEM_PROMPT =
+  'Voce e o Alfa AI, assistente local em portugues do Brasil. ' +
+  'Responda de forma natural, clara e objetiva. ' +
+  'Evite formalidade excessiva, tom institucional e frases roboticamente longas. ' +
+  'Nao se apresente em toda resposta. ' +
+  'Pergunta curta pede resposta curta. ' +
+  'Expanda apenas quando o usuario pedir detalhes ou quando isso for realmente util. ' +
+  'Quando a resposta tiver varias partes, organize em Markdown com titulos curtos, subtitulos e topicos. ' +
+  'Quando houver codigo, use bloco com tres crases. ' +
+  'Evite repeticao e respostas genericas. ' +
+  'Em conversa casual, mantenha um tom humano e coerente com o contexto. ' +
+  'Se o usuario pedir uma quantidade, entregue exatamente a quantidade pedida.';
+const SHORT_CASUAL_GREETING_PATTERN =
+  /^(oi+|ola+|opa+|e ai+|bom dia|boa tarde|boa noite)[!.?\s]*$/i;
+const SHORT_CASUAL_REACTION_PATTERN = /\b(maluquice|doidera|loucura|vixe|caramba|kkkk+|haha+|rs+)\b/i;
+const DETAIL_REQUEST_PATTERN =
+  /\b(explique|explica|detalhe|detalhado|aprofunde|aprofundar|passo a passo|compare|analise)\b/i;
 
 export type RuntimeStatus = 'not_loaded' | 'loading' | 'ready' | 'error';
 
@@ -31,6 +57,18 @@ interface RuntimeState {
 interface RuntimeContext {
   infer: (prompt: string, nPredict: number) => Promise<string>;
   release?: () => Promise<void> | void;
+}
+
+interface PromptMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+interface PromptBuildResult {
+  prompt: string;
+  nPredict: number;
+  contextMessagesCount: number;
+  lastUserChars: number;
 }
 
 interface ModelDownloadStateSnapshot {
@@ -138,6 +176,162 @@ function normalizePromptMessageContent(content: unknown): string {
     return '';
   }
   return content.replace(/\s+/g, ' ').trim();
+}
+
+function clipPromptMessageContent(content: string): string {
+  if (content.length <= MAX_PROMPT_MESSAGE_CHARS) {
+    return content;
+  }
+  return `${content.slice(0, MAX_PROMPT_MESSAGE_CHARS)}...`;
+}
+
+function countWords(content: string): number {
+  const normalized = content.trim();
+  if (!normalized) {
+    return 0;
+  }
+  return normalized.split(/\s+/).length;
+}
+
+function extractRequestedItemCount(content: string): number | null {
+  const directRequest = content.match(
+    /\b(?:me\s+fale|fale|liste|lista|cite|diga|traga|mostre|quero|me\s+de|preciso\s+de|top)\s+([1-9]|1[0-2])\b/,
+  );
+  if (directRequest) {
+    const parsed = Number(directRequest[1]);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  const itemizedRequest = content.match(
+    /\b([1-9]|1[0-2])\s+(?:itens?|opcoes?|exemplos?|ideias?|sugestoes?|passos?)\b/,
+  );
+  const match = itemizedRequest;
+  if (!match) {
+    return null;
+  }
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function toPromptMessages(messages: Message[]): PromptMessage[] {
+  const promptMessages: PromptMessage[] = [];
+
+  for (const message of messages) {
+    if (!message || (message.role !== 'user' && message.role !== 'assistant')) {
+      continue;
+    }
+    if (message.error === true) {
+      continue;
+    }
+
+    const normalizedContent = normalizePromptMessageContent(message.content);
+    if (!normalizedContent) {
+      continue;
+    }
+
+    const content = clipPromptMessageContent(normalizedContent);
+    const normalizedMessage: PromptMessage = {
+      role: message.role,
+      content,
+    };
+    const previous = promptMessages[promptMessages.length - 1];
+    if (
+      previous &&
+      previous.role === normalizedMessage.role &&
+      previous.content === normalizedMessage.content
+    ) {
+      continue;
+    }
+    promptMessages.push(normalizedMessage);
+  }
+
+  return promptMessages;
+}
+
+function selectRecentPromptMessages(messages: PromptMessage[]): PromptMessage[] {
+  const selected: PromptMessage[] = [];
+  let contextChars = 0;
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (selected.length >= MAX_PROMPT_MESSAGES) {
+      break;
+    }
+
+    const candidate = messages[index];
+    const estimatedChars = candidate.content.length + 16;
+    if (contextChars > 0 && contextChars + estimatedChars > MAX_PROMPT_CONTEXT_CHARS) {
+      break;
+    }
+
+    selected.push(candidate);
+    contextChars += estimatedChars;
+  }
+
+  selected.reverse();
+  while (selected.length > 1 && selected[0].role === 'assistant') {
+    selected.shift();
+  }
+
+  return selected;
+}
+
+function getLastUserPromptContent(messages: PromptMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === 'user') {
+      return messages[index].content;
+    }
+  }
+  return '';
+}
+
+function buildDynamicPromptInstruction(
+  lastUserMessage: string,
+  requestedItemCount: number | null,
+): string {
+  if (!lastUserMessage) {
+    return '';
+  }
+
+  const normalized = lastUserMessage.toLowerCase();
+  const wordCount = countWords(lastUserMessage);
+  const isShortMessage = lastUserMessage.length <= 24 || wordCount <= 4;
+  const isGreeting = SHORT_CASUAL_GREETING_PATTERN.test(normalized);
+  const isCasualReaction = SHORT_CASUAL_REACTION_PATTERN.test(normalized) && wordCount <= 8;
+
+  if (requestedItemCount !== null) {
+    return `Sistema: Responda de forma objetiva e entregue exatamente ${requestedItemCount} item(ns).`;
+  }
+  if (isGreeting || isCasualReaction || isShortMessage) {
+    return 'Sistema: Responda em 1 ou 2 frases curtas, com tom natural e direto.';
+  }
+  if (DETAIL_REQUEST_PATTERN.test(normalized)) {
+    return 'Sistema: O usuario pediu profundidade. Traga mais detalhes com clareza e sem enrolacao.';
+  }
+  return 'Sistema: Va direto ao ponto e evite rodeios.';
+}
+
+function resolvePredictTokens(lastUserMessage: string, requestedItemCount: number | null): number {
+  if (!lastUserMessage) {
+    return DEFAULT_PREDICT_TOKENS;
+  }
+
+  const normalized = lastUserMessage.toLowerCase();
+  const wordCount = countWords(lastUserMessage);
+  const chars = lastUserMessage.length;
+  if (requestedItemCount !== null) {
+    const estimated = 48 + requestedItemCount * 12;
+    return Math.min(MAX_PREDICT_TOKENS, Math.max(MIN_PREDICT_TOKENS, estimated));
+  }
+  if (chars <= 24 || wordCount <= 4) {
+    return MIN_PREDICT_TOKENS;
+  }
+  if (chars <= 120 && wordCount <= 24) {
+    return 96;
+  }
+  if (DETAIL_REQUEST_PATTERN.test(normalized)) {
+    return MAX_PREDICT_TOKENS;
+  }
+  return DEFAULT_PREDICT_TOKENS;
 }
 
 async function readProcFile(path: string): Promise<string | null> {
@@ -262,29 +456,45 @@ async function loadModelDownloadStateFromLoader(): Promise<ModelDownloadStateSna
   return state;
 }
 
-function buildPrompt(messages: Message[]): string {
-  const recentMessages = messages.slice(-MAX_PROMPT_MESSAGES);
-  const promptBody = recentMessages
-    .map(message => {
-      const role =
-        message.role === 'user'
-          ? 'Usuario'
-          : message.role === 'assistant'
-          ? 'Assistente'
-          : 'Sistema';
-      return `${role}: ${normalizePromptMessageContent(message.content)}`;
-    })
-    .join('\n\n');
+function buildPrompt(messages: Message[]): PromptBuildResult {
+  const normalizedMessages = toPromptMessages(messages);
+  const recentMessages = selectRecentPromptMessages(normalizedMessages);
+  const lastUserMessage =
+    getLastUserPromptContent(recentMessages) || getLastUserPromptContent(normalizedMessages);
+  const requestedItemCount = extractRequestedItemCount(lastUserMessage.toLowerCase());
+  const dynamicInstruction = buildDynamicPromptInstruction(lastUserMessage, requestedItemCount);
 
-  if (!promptBody) {
-    return 'Assistente:';
+  let promptMessages = [...recentMessages];
+  const composePrompt = () => {
+    const promptBody = promptMessages
+      .map(message => {
+        const role = message.role === 'user' ? 'Usuario' : 'Assistente';
+        return `${role}: ${message.content}`;
+      })
+      .join('\n\n');
+
+    return [
+      `Sistema: ${LOCAL_SYSTEM_PROMPT}`,
+      dynamicInstruction,
+      promptBody,
+      'Assistente:',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+  };
+
+  let prompt = composePrompt();
+  while (prompt.length > MAX_PROMPT_CHARS && promptMessages.length > 1) {
+    promptMessages.shift();
+    prompt = composePrompt();
   }
 
-  const prompt = `${promptBody}\n\nAssistente:`;
-  if (prompt.length <= MAX_PROMPT_CHARS) {
-    return prompt;
-  }
-  return prompt.slice(prompt.length - MAX_PROMPT_CHARS);
+  return {
+    prompt,
+    nPredict: resolvePredictTokens(lastUserMessage, requestedItemCount),
+    contextMessagesCount: promptMessages.length,
+    lastUserChars: lastUserMessage.length,
+  };
 }
 
 async function createLlamaRuntimeContext(modelPath: string): Promise<RuntimeContext> {
@@ -313,9 +523,19 @@ async function createLlamaRuntimeContext(modelPath: string): Promise<RuntimeCont
       const completion = (await context.completion({
         prompt,
         n_predict: nPredict,
-        temperature: 0.7,
-        top_p: 0.9,
-        stop: ['\nUsuario:', '\nSistema:', '<|im_end|>', '</s>'],
+        temperature: INFERENCE_TEMPERATURE,
+        top_p: INFERENCE_TOP_P,
+        top_k: INFERENCE_TOP_K,
+        penalty_repeat: INFERENCE_PENALTY_REPEAT,
+        penalty_last_n: INFERENCE_PENALTY_LAST_N,
+        stop: [
+          '\nUsuario:',
+          '\n\nUsuario:',
+          '\nSistema:',
+          '\n\nSistema:',
+          '<|im_end|>',
+          '</s>',
+        ],
       })) as {text?: unknown};
 
       const text = completion?.text;
@@ -462,7 +682,7 @@ export async function ensureRuntimeReady(): Promise<boolean> {
 }
 
 export async function inferWithLocalRuntime(messages: Message[]): Promise<string> {
-  const prompt = buildPrompt(messages);
+  const promptBuild = buildPrompt(messages);
   if (!runtimeContext) {
     logError(TAG, 'Inferencia solicitada sem runtimeContext');
     throw new Error('Runtime local indisponivel para inferencia');
@@ -471,10 +691,10 @@ export async function inferWithLocalRuntime(messages: Message[]): Promise<string
   logInfo(
     TAG,
     'Iniciando inferencia local',
-    `Mensagens: ${messages.length}\nEngine: ${runtimeState.engine ?? 'desconhecida'}`,
+    `Mensagens: ${messages.length}\nContexto usado: ${promptBuild.contextMessagesCount}\nPrompt chars: ${promptBuild.prompt.length}\nLast user chars: ${promptBuild.lastUserChars}\nn_predict: ${promptBuild.nPredict}\nEngine: ${runtimeState.engine ?? 'desconhecida'}`,
   );
   try {
-    const response = await runtimeContext.infer(prompt, DEFAULT_PREDICT_TOKENS);
+    const response = await runtimeContext.infer(promptBuild.prompt, promptBuild.nPredict);
     if (response === null || response === undefined) {
       logWarn(TAG, 'Retorno da inferencia veio null/undefined');
       throw new Error('Inferencia retornou valor nulo/indefinido');

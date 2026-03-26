@@ -19,6 +19,8 @@ const STUB_RESPONSE =
   '\u2699\uFE0F Modelo local ainda nao instalado. Acesse Configuracoes para instalar o modelo Qwen2.5-3B.';
 const RUNTIME_FAILURE_FALLBACK =
   'Falha ao carregar o runtime local. Veja os logs.';
+const CASUAL_SHORT_REPLY_PATTERN =
+  /^(oi+|ola+|opa+|e ai+|tudo bem|beleza|blz|valeu|obrigad[oa]|que maluquice.*|que doidera.*)[!.?\s]*$/i;
 let runtimeBindingsInitialized = false;
 
 function logInfo(tag: string, message: string, details?: string): void {
@@ -62,6 +64,56 @@ function toErrorDetails(error: unknown): string {
     return `${error.message}\n${error.stack ?? 'stack indisponivel'}`;
   }
   return String(error);
+}
+
+function normalizeModelResponse(content: string): string {
+  if (!content) {
+    return '';
+  }
+
+  let normalized = content.trim();
+  normalized = normalized.replace(/^(assistente|assistant)\s*:\s*/i, '').trim();
+
+  const leakedRoleMatch = normalized.search(/\n\s*(usuario|sistema|user|system)\s*:/i);
+  if (leakedRoleMatch >= 0) {
+    normalized = normalized.slice(0, leakedRoleMatch).trim();
+  }
+
+  return normalized.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function getLastUserContent(messages: Message[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === 'user' && typeof messages[index].content === 'string') {
+      return messages[index].content.trim();
+    }
+  }
+  return '';
+}
+
+function keepCasualReplyConcise(response: string, lastUserContent: string): string {
+  if (!response || !lastUserContent) {
+    return response;
+  }
+
+  if (!CASUAL_SHORT_REPLY_PATTERN.test(lastUserContent.trim().toLowerCase())) {
+    return response;
+  }
+  if (response.length <= 220) {
+    return response;
+  }
+
+  const firstParagraph = response.split(/\n{2,}/)[0].trim();
+  if (firstParagraph.length >= 16 && firstParagraph.length <= 220) {
+    return firstParagraph;
+  }
+
+  const firstSentence = response.match(/^(.{1,220}?[.!?])(?:\s|$)/);
+  if (firstSentence?.[1]) {
+    return firstSentence[1].trim();
+  }
+
+  return `${response.slice(0, 217).trim()}...`;
 }
 
 function ensureRuntimeBindings(): void {
@@ -147,12 +199,19 @@ export async function generateResponse(messages: Message[]): Promise<string> {
       );
       return RUNTIME_FAILURE_FALLBACK;
     }
-    if (!response.trim()) {
+    const lastUserContent = getLastUserContent(messages);
+    const normalizedResponse = normalizeModelResponse(response);
+    const finalResponse = keepCasualReplyConcise(normalizedResponse, lastUserContent);
+    if (!finalResponse.trim()) {
       logWarn(TAG, 'Inferencia retornou string vazia, aplicando fallback');
       return RUNTIME_FAILURE_FALLBACK;
     }
-    logInfo(TAG, 'Retorno da inferencia recebido', `Tamanho da resposta: ${response.length}`);
-    return response;
+    logInfo(
+      TAG,
+      'Retorno da inferencia recebido',
+      `Tamanho bruto: ${response.length}\nTamanho final: ${finalResponse.length}`,
+    );
+    return finalResponse;
   } catch (error) {
     logError(TAG, 'Falha na inferencia local, aplicando fallback seguro', toErrorDetails(error));
     return RUNTIME_FAILURE_FALLBACK;
