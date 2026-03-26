@@ -56,7 +56,10 @@ const ASSISTANT_ROLE_LINE_PATTERN = /^(assistente|assistant)\s*:\s*/i;
 const INTERNAL_PERSONA_PATTERN = /(?:voce|você)\s+e\s+o\s+alfa\s+ai/i;
 const TECHNICAL_LEAK_LINE_PATTERN =
   /\b(n_predict|stopped_limit|tokens_predicted|context_full|prompt chars|last user chars|contexto usado|engine:\s*llama\.rn)\b/i;
+const WARMUP_COOLDOWN_MS = 2 * 60 * 1000;
 let runtimeBindingsInitialized = false;
+let warmupRuntimePromise: Promise<void> | null = null;
+let lastWarmupAt = 0;
 export type ResponseStreamCallback = (partialResponse: string) => void;
 
 function logInfo(tag: string, message: string, details?: string): void {
@@ -456,13 +459,31 @@ function ensureRuntimeBindings(): void {
 
 export async function warmupRuntimeSafely(): Promise<void> {
   ensureRuntimeBindings();
-  logInfo(TAG, 'Warmup seguro do runtime iniciado');
-  try {
-    const ready = await ensureRuntimeReady();
-    logInfo(TAG, 'Warmup seguro do runtime concluido', `Runtime pronto: ${ready}`);
-  } catch (error) {
-    logError(TAG, 'Warmup seguro do runtime falhou', toErrorDetails(error));
+  const runtimeState = getRuntimeState();
+  const now = Date.now();
+  if (runtimeState.status === 'ready' && now - lastWarmupAt < WARMUP_COOLDOWN_MS) {
+    return;
   }
+  if (warmupRuntimePromise) {
+    return warmupRuntimePromise;
+  }
+
+  logInfo(TAG, 'Warmup seguro do runtime iniciado');
+  warmupRuntimePromise = (async () => {
+    try {
+      const ready = await ensureRuntimeReady();
+      if (ready) {
+        lastWarmupAt = Date.now();
+      }
+      logInfo(TAG, 'Warmup seguro do runtime concluido', `Runtime pronto: ${ready}`);
+    } catch (error) {
+      logError(TAG, 'Warmup seguro do runtime falhou', toErrorDetails(error));
+    } finally {
+      warmupRuntimePromise = null;
+    }
+  })();
+
+  return warmupRuntimePromise;
 }
 
 /**

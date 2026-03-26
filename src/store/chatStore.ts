@@ -4,6 +4,7 @@ import React, {
   useReducer,
   useEffect,
   useCallback,
+  useRef,
   ReactNode,
 } from 'react';
 import {Conversation, Message} from '../types';
@@ -17,6 +18,7 @@ import {generateId, generateConversationTitle} from '../utils/helpers';
 import {logError, logInfo} from '../services/logService';
 
 const TAG = 'ChatStore';
+const CONVERSATIONS_SAVE_DEBOUNCE_MS = 800;
 
 // ---------------------------------------------------------------------------
 // State shape
@@ -68,13 +70,18 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
       };
 
     case 'SET_CURRENT_CONVERSATION':
+      if (state.currentConversationId === action.id) {
+        return state;
+      }
       return {...state, currentConversationId: action.id};
 
     case 'ADD_MESSAGE': {
+      let changed = false;
       const updated = state.conversations.map(conv => {
         if (conv.id !== action.conversationId) {
           return conv;
         }
+        changed = true;
         const baseMessages = Array.isArray(conv.messages) ? conv.messages : [];
         return {
           ...conv,
@@ -82,10 +89,14 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
           updatedAt: Date.now(),
         };
       });
+      if (!changed) {
+        return state;
+      }
       return {...state, conversations: updated};
     }
 
     case 'UPDATE_LAST_MESSAGE': {
+      let changed = false;
       const updated = state.conversations.map(conv => {
         if (conv.id !== action.conversationId) {
           return conv;
@@ -95,6 +106,10 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
           return conv;
         }
         const last = messages[messages.length - 1];
+        if (last.content === action.content && last.error === action.error) {
+          return conv;
+        }
+        changed = true;
         messages[messages.length - 1] = {
           ...last,
           content: action.content,
@@ -102,11 +117,17 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
         };
         return {...conv, messages, updatedAt: Date.now()};
       });
+      if (!changed) {
+        return state;
+      }
       return {...state, conversations: updated};
     }
 
     case 'DELETE_CONVERSATION': {
       const remaining = state.conversations.filter(c => c.id !== action.id);
+      if (remaining.length === state.conversations.length) {
+        return state;
+      }
       const newCurrentId =
         state.currentConversationId === action.id
           ? remaining.length > 0
@@ -121,9 +142,17 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
     }
 
     case 'UPDATE_CONVERSATION_TITLE': {
-      const updated = state.conversations.map(conv =>
-        conv.id === action.id ? {...conv, title: action.title} : conv,
-      );
+      let changed = false;
+      const updated = state.conversations.map(conv => {
+        if (conv.id !== action.id || conv.title === action.title) {
+          return conv;
+        }
+        changed = true;
+        return {...conv, title: action.title};
+      });
+      if (!changed) {
+        return state;
+      }
       return {...state, conversations: updated};
     }
 
@@ -220,6 +249,9 @@ interface ChatProviderProps {
 
 export function ChatProvider({children}: ChatProviderProps): React.JSX.Element {
   const [state, dispatch] = useReducer(chatReducer, initialState);
+  const conversationsPersistTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestConversationsRef = useRef<Conversation[]>([]);
+  const lastPersistedCurrentConversationIdRef = useRef<string | null>(null);
 
   // Load persisted data on mount
   useEffect(() => {
@@ -260,33 +292,55 @@ export function ChatProvider({children}: ChatProviderProps): React.JSX.Element {
 
   // Auto-save whenever conversations change
   useEffect(() => {
+    latestConversationsRef.current = state.conversations;
     if (!state.isInitialized) {
       return;
     }
-    logInfo(
-      TAG,
-      'Persistencia de conversas iniciada',
-      `Total de conversas: ${state.conversations.length}`,
-    );
-    void (async () => {
-      try {
-        await saveConversations(state.conversations);
-        logInfo(TAG, 'Persistencia de conversas concluida');
-      } catch (error) {
-        const details =
-          error instanceof Error
-            ? `${error.message}\n${error.stack ?? 'stack indisponivel'}`
-            : String(error);
-        logError(TAG, 'Persistencia de conversas falhou', details);
-      }
-    })();
+    if (conversationsPersistTimeoutRef.current) {
+      clearTimeout(conversationsPersistTimeoutRef.current);
+    }
+    conversationsPersistTimeoutRef.current = setTimeout(() => {
+      conversationsPersistTimeoutRef.current = null;
+      void (async () => {
+        try {
+          await saveConversations(latestConversationsRef.current);
+          logInfo(
+            TAG,
+            'Persistencia de conversas concluida',
+            `Total de conversas: ${latestConversationsRef.current.length}`,
+          );
+        } catch (error) {
+          const details =
+            error instanceof Error
+              ? `${error.message}\n${error.stack ?? 'stack indisponivel'}`
+              : String(error);
+          logError(TAG, 'Persistencia de conversas falhou', details);
+        }
+      })();
+    }, CONVERSATIONS_SAVE_DEBOUNCE_MS);
   }, [state.conversations, state.isInitialized]);
+
+  useEffect(() => {
+    return () => {
+      if (conversationsPersistTimeoutRef.current) {
+        clearTimeout(conversationsPersistTimeoutRef.current);
+        conversationsPersistTimeoutRef.current = null;
+        void saveConversations(latestConversationsRef.current).catch(error => {
+          logError(TAG, 'Persistencia final de conversas falhou', toErrorDetails(error));
+        });
+      }
+    };
+  }, []);
 
   // Auto-save current conversation ID
   useEffect(() => {
     if (!state.isInitialized || state.currentConversationId === null) {
       return;
     }
+    if (lastPersistedCurrentConversationIdRef.current === state.currentConversationId) {
+      return;
+    }
+    lastPersistedCurrentConversationIdRef.current = state.currentConversationId;
     void (async () => {
       try {
         logInfo(
@@ -342,28 +396,12 @@ export function ChatProvider({children}: ChatProviderProps): React.JSX.Element {
       logInfo(TAG, 'Atualizacao do store concluida');
       logInfo(TAG, 'Selecao da conversa atual concluida', conversation.id);
 
-      void (async () => {
-        try {
-          logInfo(TAG, 'Persistencia no storage iniciada');
-          const nextConversations = [conversation, ...state.conversations];
-          await saveConversations(nextConversations);
-          await saveCurrentConversationId(conversation.id);
-          logInfo(TAG, 'Persistencia no storage concluida');
-        } catch (error) {
-          logError(
-            TAG,
-            'Persistencia no storage falhou; conversa mantida em memoria',
-            toErrorDetails(error),
-          );
-        }
-      })();
-
       return conversation.id;
     } catch (error) {
       logError(TAG, 'Catch no fluxo de criacao de nova conversa', toErrorDetails(error));
       return null;
     }
-  }, [state.conversations]);
+  }, []);
 
   const setCurrentConversation = useCallback(
     (id: string | null) => {

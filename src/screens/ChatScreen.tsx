@@ -29,7 +29,8 @@ type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
 const TAG = 'ChatScreen';
 const SEND_FALLBACK_MESSAGE = 'Falha ao carregar o runtime local. Veja os logs.';
-const STREAM_UPDATE_INTERVAL_MS = 45;
+const STREAM_UPDATE_INTERVAL_MS = 70;
+const MAX_RUNTIME_MESSAGES = 16;
 
 function toErrorDetails(error: unknown): string {
   if (error instanceof Error) {
@@ -48,8 +49,6 @@ export default function ChatScreen(): React.JSX.Element {
 
   const [inputText, setInputText] = useState('');
   const flatListRef = useRef<FlatList<Message>>(null);
-  const renderCountRef = useRef(0);
-  renderCountRef.current += 1;
 
   // Resolve active conversation ID safely from route params/store/list
   const conversationId = useMemo(() => {
@@ -69,18 +68,20 @@ export default function ChatScreen(): React.JSX.Element {
     () => messages.filter(message => message?.role === 'user' || message?.role === 'assistant'),
     [messages],
   );
+  const reversedVisibleMessages = useMemo(
+    () => [...visibleMessages].reverse(),
+    [visibleMessages],
+  );
+  const runtimeMessagesForInference = useMemo(() => {
+    if (visibleMessages.length <= MAX_RUNTIME_MESSAGES) {
+      return visibleMessages;
+    }
+    return visibleMessages.slice(-MAX_RUNTIME_MESSAGES);
+  }, [visibleMessages]);
   const isLoading = state.isLoading;
   // Em Android, inverted + maintainVisibleContentPosition pode causar crash nativo da lista.
   const maintainVisibleContentPosition =
     Platform.OS === 'ios' ? {minIndexForVisible: 0} : undefined;
-
-  useEffect(() => {
-    logInfo(
-      TAG,
-      'Render do ChatScreen concluido',
-      `render=${renderCountRef.current} conversationId=${conversationId || 'none'} visibleMessages=${visibleMessages.length} currentConversationId=${state.currentConversationId ?? 'null'}`,
-    );
-  }, [conversationId, visibleMessages.length, state.currentConversationId]);
 
   // Sync current conversation when navigating directly to a chat
   useEffect(() => {
@@ -137,54 +138,38 @@ export default function ChatScreen(): React.JSX.Element {
     };
 
     try {
-      logInfo(TAG, 'Clique em enviar recebido');
       const trimmed = inputText.trim();
       if (!trimmed || isLoading || !targetConversationId) {
-        logInfo(
-          TAG,
-          'Envio ignorado por validacao',
-          `textoVazio=${!trimmed} isLoading=${isLoading} semConversa=${!targetConversationId}`,
-        );
         return;
       }
 
-      logInfo(TAG, 'Clique em enviar validado');
       setInputText('');
       setLoading(true);
-      logInfo(TAG, 'Estado de loading ativado para envio');
-      logInfo(TAG, 'Criacao da mensagem do usuario iniciada', truncateText(trimmed, 60));
 
       addMessage(targetConversationId, {
         role: 'user',
         content: trimmed,
       });
-      logInfo(TAG, 'Criacao da mensagem do usuario concluida');
-      logInfo(TAG, 'Persistencia da mensagem disparada (autosave assincrono)');
 
-      logInfo(TAG, 'Criacao da mensagem placeholder do assistente iniciada');
       addMessage(targetConversationId, {
         role: 'assistant',
         content: '',
       });
       assistantPlaceholderCreated = true;
-      logInfo(TAG, 'Criacao da mensagem placeholder do assistente concluida');
-      logInfo(TAG, 'Persistencia da mensagem placeholder disparada (autosave assincrono)');
 
-      const allMessages = [...visibleMessages, {
+      const allMessages = [...runtimeMessagesForInference, {
         id: 'temp-user',
         role: 'user' as const,
         content: trimmed,
         timestamp: Date.now(),
       }];
 
-      logInfo(TAG, 'Entrada no AIService iniciada');
       const response = await generateResponseStream(allMessages, (partialText: string) => {
         if (!partialText) {
           return;
         }
         scheduleStreamUpdate(partialText);
       });
-      logInfo(TAG, 'Entrada no AIService concluida');
       if (streamTimer) {
         clearTimeout(streamTimer);
         streamTimer = null;
@@ -194,12 +179,10 @@ export default function ChatScreen(): React.JSX.Element {
       if (!response) {
         logError(TAG, 'generateResponseStream retornou null/undefined/vazio no ChatScreen');
         updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, true);
-        logInfo(TAG, 'Fallback aplicado no ChatScreen apos retorno invalido');
         return;
       }
 
       updateLastMessage(targetConversationId, response);
-      logInfo(TAG, 'Mensagem do assistente atualizada com retorno da inferencia');
     } catch (error) {
       logError(TAG, 'Catch no fluxo de envio do chat', toErrorDetails(error));
       if (streamTimer) {
@@ -209,27 +192,23 @@ export default function ChatScreen(): React.JSX.Element {
       if (targetConversationId) {
         if (assistantPlaceholderCreated) {
           updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, true);
-          logInfo(TAG, 'Fallback aplicado no placeholder existente');
         } else {
           addMessage(targetConversationId, {
             role: 'assistant',
             content: SEND_FALLBACK_MESSAGE,
             error: true,
           });
-          logInfo(TAG, 'Fallback adicionado como nova mensagem do assistente');
         }
       }
     } finally {
       setLoading(false);
-      logInfo(TAG, 'Estado de loading finalizado');
       flatListRef.current?.scrollToOffset({offset: 0, animated: true});
-      logInfo(TAG, 'Fluxo de envio finalizado');
     }
   }, [
     inputText,
     isLoading,
     conversationId,
-    visibleMessages,
+    runtimeMessagesForInference,
     addMessage,
     updateLastMessage,
     setLoading,
@@ -299,7 +278,7 @@ export default function ChatScreen(): React.JSX.Element {
         ) : (
           <FlatList
             ref={flatListRef}
-            data={[...visibleMessages].reverse()}
+            data={reversedVisibleMessages}
             renderItem={renderMessage}
             keyExtractor={keyExtractor}
             inverted
@@ -307,6 +286,11 @@ export default function ChatScreen(): React.JSX.Element {
             showsVerticalScrollIndicator={false}
             keyboardShouldPersistTaps="handled"
             maintainVisibleContentPosition={maintainVisibleContentPosition}
+            removeClippedSubviews={Platform.OS === 'android'}
+            windowSize={8}
+            initialNumToRender={10}
+            maxToRenderPerBatch={8}
+            updateCellsBatchingPeriod={40}
           />
         )}
 

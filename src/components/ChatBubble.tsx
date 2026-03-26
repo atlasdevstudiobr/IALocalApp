@@ -1,10 +1,9 @@
-import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import React, {memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {View, Text, StyleSheet, Pressable, Platform, Clipboard} from 'react-native';
 import {Message} from '../types';
 import {colors, spacing, fonts, radius} from '../theme';
 import {formatDate} from '../utils/helpers';
 import TypingIndicator from './TypingIndicator';
-import {logInfo} from '../services/logService';
 import {
   getCachedLocalSafetyDisabled,
   loadLocalSafetyDisabled,
@@ -336,11 +335,8 @@ function parseMarkdownBlocks(content: string): MarkdownBlock[] {
   return normalizedBlocks;
 }
 
-export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
-  const TAG = 'ChatBubble';
-  const renderCountRef = useRef(0);
+function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
   const copyResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  renderCountRef.current += 1;
   const [copiedBlockIndex, setCopiedBlockIndex] = useState<number | null>(null);
   const [isLocalSafetyDisabled, setIsLocalSafetyDisabled] = useState<boolean>(
     getCachedLocalSafetyDisabled(),
@@ -354,7 +350,6 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
     typeof message.timestamp === 'number' && Number.isFinite(message.timestamp)
       ? message.timestamp
       : Date.now();
-  const safeId = typeof message.id === 'string' && message.id ? message.id : 'invalid-message-id';
 
   const isUser = safeRole === 'user';
   const isError = message.error === true;
@@ -421,14 +416,6 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
       unsubscribe();
     };
   }, []);
-
-  useEffect(() => {
-    logInfo(
-      TAG,
-      'Render do ChatBubble concluido',
-      `render=${renderCountRef.current} id=${safeId} role=${safeRole} isTyping=${isTyping} localSafetyDisabled=${isLocalSafetyDisabled}`,
-    );
-  }, [safeId, safeRole, isTyping, isLocalSafetyDisabled]);
 
   useEffect(() => {
     return () => {
@@ -558,6 +545,18 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
     </View>
   );
 }
+
+function areEqual(prev: ChatBubbleProps, next: ChatBubbleProps): boolean {
+  return (
+    prev.message.id === next.message.id &&
+    prev.message.role === next.message.role &&
+    prev.message.content === next.message.content &&
+    prev.message.timestamp === next.message.timestamp &&
+    prev.message.error === next.message.error
+  );
+}
+
+export default memo(ChatBubble, areEqual);
 
 const styles = StyleSheet.create({
   row: {

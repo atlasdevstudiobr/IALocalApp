@@ -3,15 +3,36 @@ import {AppLog} from '../types';
 import {generateId, formatDate} from '../utils/helpers';
 
 const MAX_MEMORY_LOGS = 200;
+const MAX_STORAGE_LOGS = 100;
 const STORAGE_KEY = '@alfaai_logs';
+const LOG_PERSIST_DEBOUNCE_MS = 1200;
 
 type LogListener = (logs: AppLog[]) => void;
 
 let memoryLogs: AppLog[] = [];
 const listeners: Set<LogListener> = new Set();
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
 function notifyListeners(): void {
   listeners.forEach(listener => listener([...memoryLogs]));
+}
+
+function schedulePersistLogs(delayMs = LOG_PERSIST_DEBOUNCE_MS): void {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+  }
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    void persistLogsSnapshot();
+  }, delayMs);
+}
+
+async function persistLogsSnapshot(): Promise<void> {
+  try {
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(memoryLogs.slice(0, MAX_STORAGE_LOGS)));
+  } catch (_e) {
+    // Silently ignore storage errors for logs
+  }
 }
 
 /**
@@ -34,12 +55,7 @@ export async function addLog(
 
   memoryLogs = [log, ...memoryLogs].slice(0, MAX_MEMORY_LOGS);
   notifyListeners();
-
-  try {
-    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(memoryLogs.slice(0, 100)));
-  } catch (_e) {
-    // Silently ignore storage errors for logs
-  }
+  schedulePersistLogs();
 }
 
 /**
@@ -55,6 +71,10 @@ export function getLogs(): AppLog[] {
 export async function clearLogs(): Promise<void> {
   memoryLogs = [];
   notifyListeners();
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
   try {
     await AsyncStorage.removeItem(STORAGE_KEY);
   } catch (_e) {

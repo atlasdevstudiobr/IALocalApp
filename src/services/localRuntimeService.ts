@@ -9,17 +9,21 @@ const TAG = 'LocalRuntimeService';
 const EXPLICIT_RUNTIME_ENGINE = 'llama.rn';
 const EXPLICIT_RUNTIME_STRATEGY = 'static-import';
 
-const DEFAULT_CONTEXT_SIZE = 1024;
-const DEFAULT_BATCH_SIZE = 128;
-const DEFAULT_PREDICT_TOKENS = 192;
-const MIN_PREDICT_TOKENS = 72;
-const MAX_PREDICT_TOKENS = 384;
-const MAX_RETRY_PREDICT_TOKENS = 640;
+const DEFAULT_CONTEXT_SIZE = 768;
+const DEFAULT_BATCH_SIZE = 96;
+const DEFAULT_UBATCH_SIZE = 48;
+const DEFAULT_THREADS = 4;
+const MIN_THREADS = 2;
+const MAX_THREADS = 6;
+const DEFAULT_PREDICT_TOKENS = 160;
+const MIN_PREDICT_TOKENS = 56;
+const MAX_PREDICT_TOKENS = 320;
+const MAX_RETRY_PREDICT_TOKENS = 480;
 const MAX_TRUNCATION_RETRIES = 1;
-const MAX_PROMPT_MESSAGES = 10;
-const MAX_PROMPT_CONTEXT_CHARS = 2800;
-const MAX_PROMPT_CHARS = 3600;
-const MAX_PROMPT_MESSAGE_CHARS = 1200;
+const MAX_PROMPT_MESSAGES = 8;
+const MAX_PROMPT_CONTEXT_CHARS = 2000;
+const MAX_PROMPT_CHARS = 2800;
+const MAX_PROMPT_MESSAGE_CHARS = 900;
 const INFERENCE_TEMPERATURE = 0.62;
 const INFERENCE_TOP_P = 0.88;
 const INFERENCE_TOP_K = 40;
@@ -81,6 +85,10 @@ interface RuntimeInferenceResult {
 
 type RuntimePartialCallback = (partialText: string) => void;
 
+interface RuntimeTuningProfile {
+  nThreads: number;
+}
+
 interface PromptMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -105,6 +113,7 @@ let runtimeContext: RuntimeContext | null = null;
 let runtimeLoadPromise: Promise<boolean> | null = null;
 let modelDownloadStateLoader: ModelDownloadStateLoader | null = null;
 let runtimeCompatibilityProbePromise: Promise<string | null> | null = null;
+let runtimeTuningProfilePromise: Promise<RuntimeTuningProfile> | null = null;
 
 function logInfo(tag: string, message: string, details?: string): void {
   try {
@@ -282,6 +291,9 @@ function selectRecentPromptMessages(messages: PromptMessage[]): PromptMessage[] 
     const candidate = messages[index];
     const estimatedChars = candidate.content.length + 16;
     if (contextChars > 0 && contextChars + estimatedChars > MAX_PROMPT_CONTEXT_CHARS) {
+      if (candidate.role === 'assistant') {
+        continue;
+      }
       break;
     }
 
@@ -347,16 +359,19 @@ function resolvePredictTokens(lastUserMessage: string, requestedItemCount: numbe
     const estimated = 84 + requestedItemCount * 18;
     return Math.min(MAX_PREDICT_TOKENS, Math.max(MIN_PREDICT_TOKENS, estimated));
   }
-  if (chars <= 24 || wordCount <= 4) {
+  if (chars <= 20 || wordCount <= 3) {
     return MIN_PREDICT_TOKENS;
   }
-  if (chars <= 120 && wordCount <= 24) {
-    return 168;
+  if (chars <= 72 && wordCount <= 14) {
+    return 112;
+  }
+  if (chars <= 140 && wordCount <= 28) {
+    return DEFAULT_PREDICT_TOKENS;
   }
   if (DETAIL_REQUEST_PATTERN.test(normalized)) {
     return MAX_PREDICT_TOKENS;
   }
-  return DEFAULT_PREDICT_TOKENS;
+  return 224;
 }
 
 function hasUnclosedCodeFence(content: string): boolean {
@@ -382,6 +397,9 @@ function shouldRetryAfterTruncation(
   result: RuntimeInferenceResult,
   requestedPredictTokens: number,
 ): boolean {
+  if (requestedPredictTokens < 220 || result.contextFull) {
+    return false;
+  }
   const reachedPredictLimit =
     result.truncated ||
     result.stoppedLimit === 1 ||
@@ -416,6 +434,33 @@ function parseMemTotalKb(memInfoRaw: string | null): number | null {
   }
   const parsed = Number(match[1]);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function resolveThreadCountFromCpuInfo(cpuInfoRaw: string | null): number {
+  if (!cpuInfoRaw) {
+    return DEFAULT_THREADS;
+  }
+
+  const cpuCoreMatches = cpuInfoRaw.match(/^processor\s*:/gim);
+  const coreCount = cpuCoreMatches ? cpuCoreMatches.length : 0;
+  if (!Number.isFinite(coreCount) || coreCount <= 0) {
+    return DEFAULT_THREADS;
+  }
+
+  return Math.max(MIN_THREADS, Math.min(MAX_THREADS, coreCount - 1));
+}
+
+async function loadRuntimeTuningProfile(): Promise<RuntimeTuningProfile> {
+  if (!runtimeTuningProfilePromise) {
+    runtimeTuningProfilePromise = (async () => {
+      const cpuInfo = Platform.OS === 'android' ? await readProcFile(CPU_INFO_PATH) : null;
+      return {
+        nThreads: resolveThreadCountFromCpuInfo(cpuInfo),
+      };
+    })();
+  }
+
+  return runtimeTuningProfilePromise;
 }
 
 function readPlatformConstant(constants: Record<string, unknown>, key: string): string {
@@ -560,19 +605,24 @@ function buildPrompt(messages: Message[]): PromptBuildResult {
   };
 }
 
-async function createLlamaRuntimeContext(modelPath: string): Promise<RuntimeContext> {
+async function createLlamaRuntimeContext(
+  modelPath: string,
+  tuning: RuntimeTuningProfile,
+): Promise<RuntimeContext> {
   const runtimeModelPath = normalizeModelPath(modelPath);
 
   logInfo(
     TAG,
     'Tentativa de criar contexto do runtime iniciada',
-    `Engine: ${EXPLICIT_RUNTIME_ENGINE}\nModelo: ${runtimeModelPath}`,
+    `Engine: ${EXPLICIT_RUNTIME_ENGINE}\nModelo: ${runtimeModelPath}\nn_ctx=${DEFAULT_CONTEXT_SIZE}\nn_batch=${DEFAULT_BATCH_SIZE}\nn_ubatch=${DEFAULT_UBATCH_SIZE}\nn_threads=${tuning.nThreads}`,
   );
 
   const context = (await initLlama({
     model: runtimeModelPath,
     n_ctx: DEFAULT_CONTEXT_SIZE,
     n_batch: DEFAULT_BATCH_SIZE,
+    n_ubatch: DEFAULT_UBATCH_SIZE,
+    n_threads: tuning.nThreads,
     use_mmap: true,
     use_mlock: false,
   })) as LlamaContext;
@@ -588,6 +638,7 @@ async function createLlamaRuntimeContext(modelPath: string): Promise<RuntimeCont
         {
           prompt,
           n_predict: nPredict,
+          n_threads: tuning.nThreads,
           temperature: INFERENCE_TEMPERATURE,
           top_p: INFERENCE_TOP_P,
           top_k: INFERENCE_TOP_K,
@@ -725,6 +776,7 @@ export async function ensureRuntimeReady(): Promise<boolean> {
 
     let resolvedModelPath: string | undefined;
     let validatedModelSize = 0;
+    let tuningProfile: RuntimeTuningProfile = {nThreads: DEFAULT_THREADS};
 
     try {
       const compatibilityBlockReason = await getRuntimeCompatibilityBlockReason();
@@ -790,7 +842,8 @@ export async function ensureRuntimeReady(): Promise<boolean> {
         return false;
       }
 
-      runtimeContext = await createLlamaRuntimeContext(modelState.filePath);
+      tuningProfile = await loadRuntimeTuningProfile();
+      runtimeContext = await createLlamaRuntimeContext(modelState.filePath, tuningProfile);
       runtimeState = {
         status: 'ready',
         modelPath: modelState.filePath,
@@ -799,7 +852,7 @@ export async function ensureRuntimeReady(): Promise<boolean> {
       logInfo(
         TAG,
         'Runtime local carregado com sucesso',
-        `Engine: ${EXPLICIT_RUNTIME_ENGINE}\nModelo: ${modelState.filePath}\nTamanho validado: ${validatedModelSize} bytes`,
+        `Engine: ${EXPLICIT_RUNTIME_ENGINE}\nModelo: ${modelState.filePath}\nTamanho validado: ${validatedModelSize} bytes\nn_threads=${tuningProfile.nThreads}`,
       );
       return true;
     } catch (error) {

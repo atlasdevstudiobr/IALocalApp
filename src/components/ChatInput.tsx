@@ -1,4 +1,4 @@
-import React, {useRef, useCallback, useEffect} from 'react';
+import React, {useRef, useCallback, memo} from 'react';
 import {
   View,
   TextInput,
@@ -8,7 +8,7 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import {colors, spacing, fonts, radius} from '../theme';
-import {logError, logInfo} from '../services/logService';
+import {logError} from '../services/logService';
 
 interface ChatInputProps {
   value: string;
@@ -19,7 +19,7 @@ interface ChatInputProps {
   placeholder?: string;
 }
 
-export default function ChatInput({
+function ChatInput({
   value,
   onChangeText,
   onSend,
@@ -27,41 +27,24 @@ export default function ChatInput({
   autoFocus = false,
   placeholder = 'Mensagem...',
 }: ChatInputProps): React.JSX.Element {
-  const TAG = 'ChatInput';
   const inputRef = useRef<TextInput>(null);
 
   const handleSend = useCallback(() => {
     try {
-      logInfo(TAG, 'Clique no botao enviar recebido');
       if (!value.trim() || isLoading) {
-        logInfo(
-          TAG,
-          'Envio bloqueado por validacao no ChatInput',
-          `textoVazio=${!value.trim()} isLoading=${isLoading}`,
-        );
         return;
       }
-      logInfo(TAG, 'Chamando onSend no ChatInput');
       onSend();
-      logInfo(TAG, 'onSend concluido no ChatInput');
     } catch (error) {
       const details =
         error instanceof Error
           ? `${error.message}\n${error.stack ?? 'stack indisponivel'}`
           : String(error);
-      logError(TAG, 'Erro no handleSend do ChatInput', details);
+      logError('ChatInput', 'Erro no handleSend do ChatInput', details);
     }
   }, [value, isLoading, onSend]);
 
   const canSend = value.trim().length > 0 && !isLoading;
-
-  useEffect(() => {
-    logInfo(
-      TAG,
-      'Render do ChatInput concluido',
-      `isLoading=${isLoading} canSend=${canSend} valueLength=${value.length}`,
-    );
-  }, [isLoading, canSend, value.length]);
 
   return (
     <View style={styles.container}>
@@ -102,6 +85,19 @@ export default function ChatInput({
     </View>
   );
 }
+
+function areEqual(prev: ChatInputProps, next: ChatInputProps): boolean {
+  return (
+    prev.value === next.value &&
+    prev.isLoading === next.isLoading &&
+    prev.autoFocus === next.autoFocus &&
+    prev.placeholder === next.placeholder &&
+    prev.onChangeText === next.onChangeText &&
+    prev.onSend === next.onSend
+  );
+}
+
+export default memo(ChatInput, areEqual);
 
 const styles = StyleSheet.create({
   container: {
