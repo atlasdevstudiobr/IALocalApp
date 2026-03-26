@@ -14,7 +14,7 @@ import {
   loadCurrentConversationId,
 } from '../services/storageService';
 import {generateId, generateConversationTitle} from '../utils/helpers';
-import {logInfo} from '../services/logService';
+import {logError, logInfo} from '../services/logService';
 
 const TAG = 'ChatStore';
 
@@ -198,7 +198,23 @@ export function ChatProvider({children}: ChatProviderProps): React.JSX.Element {
     if (!state.isInitialized) {
       return;
     }
-    saveConversations(state.conversations);
+    logInfo(
+      TAG,
+      'Persistencia de conversas iniciada',
+      `Total de conversas: ${state.conversations.length}`,
+    );
+    void (async () => {
+      try {
+        await saveConversations(state.conversations);
+        logInfo(TAG, 'Persistencia de conversas concluida');
+      } catch (error) {
+        const details =
+          error instanceof Error
+            ? `${error.message}\n${error.stack ?? 'stack indisponivel'}`
+            : String(error);
+        logError(TAG, 'Persistencia de conversas falhou', details);
+      }
+    })();
   }, [state.conversations, state.isInitialized]);
 
   // Auto-save current conversation ID

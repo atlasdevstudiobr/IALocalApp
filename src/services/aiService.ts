@@ -15,6 +15,25 @@ const TAG = 'AIService';
  */
 const STUB_RESPONSE =
   '\u2699\uFE0F Modelo local ainda nao instalado. Acesse Configuracoes para instalar o modelo Qwen2.5-3B.';
+const RUNTIME_FAILURE_FALLBACK =
+  'Falha ao carregar o runtime local. Veja os logs.';
+
+function toErrorDetails(error: unknown): string {
+  if (error instanceof Error) {
+    return `${error.message}\n${error.stack ?? 'stack indisponivel'}`;
+  }
+  return String(error);
+}
+
+export async function warmupRuntimeSafely(): Promise<void> {
+  logInfo(TAG, 'Warmup seguro do runtime iniciado');
+  try {
+    const ready = await ensureRuntimeReady();
+    logInfo(TAG, 'Warmup seguro do runtime concluido', `Runtime pronto: ${ready}`);
+  } catch (error) {
+    logError(TAG, 'Warmup seguro do runtime falhou', toErrorDetails(error));
+  }
+}
 
 /**
  * Generates a response from the AI model.
@@ -28,32 +47,53 @@ export async function generateResponse(messages: Message[]): Promise<string> {
   const lastMessage = messages[messages.length - 1];
   logInfo(
     TAG,
-    `generateResponse called with ${messages.length} message(s)`,
+    `Entrada no AIService.generateResponse com ${messages.length} mensagem(ns)`,
     `Last message role: ${lastMessage?.role ?? 'none'}`,
   );
 
-  const runtimeReady = await ensureRuntimeReady();
+  let runtimeReady = false;
+  try {
+    logInfo(TAG, 'Checagem de runtime/modelo iniciada');
+    runtimeReady = await ensureRuntimeReady();
+    logInfo(TAG, 'Checagem de runtime/modelo concluida', `Runtime pronto: ${runtimeReady}`);
+  } catch (error) {
+    logError(TAG, 'Erro ao checar/carregar runtime', toErrorDetails(error));
+    return RUNTIME_FAILURE_FALLBACK;
+  }
+
   if (!runtimeReady) {
     const state = getRuntimeState();
-    logWarn(
-      TAG,
-      'Runtime indisponivel, retornando fallback stub',
-      `Status runtime: ${state.status}\nMotivo: ${state.errorMessage ?? 'modelo nao carregado'}`,
-    );
-    return STUB_RESPONSE;
+    const detail = `Status runtime: ${state.status}\nMotivo: ${
+      state.errorMessage ?? 'modelo nao carregado'
+    }`;
+    if (state.status === 'not_loaded') {
+      logWarn(TAG, 'Runtime indisponivel por modelo nao carregado, fallback de modelo', detail);
+      return STUB_RESPONSE;
+    }
+    logWarn(TAG, 'Runtime indisponivel, fallback de falha de runtime', detail);
+    return RUNTIME_FAILURE_FALLBACK;
   }
 
   try {
+    logInfo(TAG, 'Inicio da inferencia via runtime local');
     const response = await inferWithLocalRuntime(messages);
-    if (!response) {
-      logWarn(TAG, 'Inferencia vazia, retornando fallback stub');
-      return STUB_RESPONSE;
+    if (typeof response !== 'string') {
+      logWarn(
+        TAG,
+        'Inferencia retornou valor invalido (nao string), aplicando fallback',
+        `Tipo retornado: ${typeof response}`,
+      );
+      return RUNTIME_FAILURE_FALLBACK;
     }
+    if (!response.trim()) {
+      logWarn(TAG, 'Inferencia retornou string vazia, aplicando fallback');
+      return RUNTIME_FAILURE_FALLBACK;
+    }
+    logInfo(TAG, 'Retorno da inferencia recebido', `Tamanho da resposta: ${response.length}`);
     return response;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logError(TAG, 'Falha na inferencia local, retornando fallback stub', message);
-    return STUB_RESPONSE;
+    logError(TAG, 'Falha na inferencia local, aplicando fallback seguro', toErrorDetails(error));
+    return RUNTIME_FAILURE_FALLBACK;
   }
 }
 

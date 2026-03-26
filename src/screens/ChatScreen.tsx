@@ -15,7 +15,7 @@ import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 
 import {Message} from '../types';
 import {useChatStore} from '../store/chatStore';
-import {generateResponse} from '../services/aiService';
+import {generateResponse, warmupRuntimeSafely} from '../services/aiService';
 import {logError, logInfo} from '../services/logService';
 import ChatBubble from '../components/ChatBubble';
 import ChatInput from '../components/ChatInput';
@@ -28,6 +28,14 @@ type ChatScreenRouteProp = RouteProp<RootStackParamList, 'Chat'>;
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
 const TAG = 'ChatScreen';
+const SEND_FALLBACK_MESSAGE = 'Falha ao carregar o runtime local. Veja os logs.';
+
+function toErrorDetails(error: unknown): string {
+  if (error instanceof Error) {
+    return `${error.message}\n${error.stack ?? 'stack indisponivel'}`;
+  }
+  return String(error);
+}
 
 export default function ChatScreen(): React.JSX.Element {
   const insets = useSafeAreaInsets();
@@ -55,30 +63,48 @@ export default function ChatScreen(): React.JSX.Element {
     }
   }, [conversationId, state.currentConversationId, setCurrentConversation]);
 
+  useEffect(() => {
+    logInfo(TAG, 'Warmup do runtime disparado fora do clique em enviar');
+    void warmupRuntimeSafely();
+  }, []);
+
   const handleSend = useCallback(async () => {
-    const trimmed = inputText.trim();
-    if (!trimmed || isLoading || !conversationId) {
-      return;
-    }
-
-    setInputText('');
-    setLoading(true);
-
-    logInfo(TAG, 'Sending user message', truncateText(trimmed, 60));
-
-    // Add user message
-    addMessage(conversationId, {
-      role: 'user',
-      content: trimmed,
-    });
-
-    // Add placeholder assistant message (shows TypingIndicator while empty)
-    const assistantMsg = addMessage(conversationId, {
-      role: 'assistant',
-      content: '',
-    });
-
+    let targetConversationId = conversationId;
+    let assistantPlaceholderCreated = false;
     try {
+      logInfo(TAG, 'Clique em enviar recebido');
+      const trimmed = inputText.trim();
+      if (!trimmed || isLoading || !targetConversationId) {
+        logInfo(
+          TAG,
+          'Envio ignorado por validacao',
+          `textoVazio=${!trimmed} isLoading=${isLoading} semConversa=${!targetConversationId}`,
+        );
+        return;
+      }
+
+      logInfo(TAG, 'Clique em enviar validado');
+      setInputText('');
+      setLoading(true);
+      logInfo(TAG, 'Estado de loading ativado para envio');
+      logInfo(TAG, 'Criacao da mensagem do usuario iniciada', truncateText(trimmed, 60));
+
+      addMessage(targetConversationId, {
+        role: 'user',
+        content: trimmed,
+      });
+      logInfo(TAG, 'Criacao da mensagem do usuario concluida');
+      logInfo(TAG, 'Persistencia da mensagem disparada (autosave assincrono)');
+
+      logInfo(TAG, 'Criacao da mensagem placeholder do assistente iniciada');
+      addMessage(targetConversationId, {
+        role: 'assistant',
+        content: '',
+      });
+      assistantPlaceholderCreated = true;
+      logInfo(TAG, 'Criacao da mensagem placeholder do assistente concluida');
+      logInfo(TAG, 'Persistencia da mensagem placeholder disparada (autosave assincrono)');
+
       const allMessages = [...messages, {
         id: 'temp-user',
         role: 'user' as const,
@@ -86,24 +112,40 @@ export default function ChatScreen(): React.JSX.Element {
         timestamp: Date.now(),
       }];
 
+      logInfo(TAG, 'Entrada no AIService iniciada');
       const response = await generateResponse(allMessages);
-      updateLastMessage(conversationId, response);
-      logInfo(TAG, 'Received AI response');
+      logInfo(TAG, 'Entrada no AIService concluida');
+
+      if (!response) {
+        logError(TAG, 'generateResponse retornou null/undefined/vazio no ChatScreen');
+        updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, true);
+        logInfo(TAG, 'Fallback aplicado no ChatScreen apos retorno invalido');
+        return;
+      }
+
+      updateLastMessage(targetConversationId, response);
+      logInfo(TAG, 'Mensagem do assistente atualizada com retorno da inferencia');
     } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : 'Erro desconhecido';
-      updateLastMessage(
-        conversationId,
-        `Erro ao gerar resposta: ${errorMessage}`,
-        true,
-      );
-      logError(TAG, 'Failed to generate AI response', errorMessage);
+      logError(TAG, 'Catch no fluxo de envio do chat', toErrorDetails(error));
+      if (targetConversationId) {
+        if (assistantPlaceholderCreated) {
+          updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, true);
+          logInfo(TAG, 'Fallback aplicado no placeholder existente');
+        } else {
+          addMessage(targetConversationId, {
+            role: 'assistant',
+            content: SEND_FALLBACK_MESSAGE,
+            error: true,
+          });
+          logInfo(TAG, 'Fallback adicionado como nova mensagem do assistente');
+        }
+      }
     } finally {
       setLoading(false);
+      logInfo(TAG, 'Estado de loading finalizado');
       flatListRef.current?.scrollToOffset({offset: 0, animated: true});
+      logInfo(TAG, 'Fluxo de envio finalizado');
     }
-
-    void assistantMsg;
   }, [
     inputText,
     isLoading,

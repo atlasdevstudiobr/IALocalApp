@@ -34,6 +34,13 @@ function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function toErrorDetails(error: unknown): string {
+  if (error instanceof Error) {
+    return `${error.message}\n${error.stack ?? 'stack indisponivel'}`;
+  }
+  return String(error);
+}
+
 function buildPrompt(messages: Message[]): string {
   const prompt = messages
     .map(message => {
@@ -61,11 +68,12 @@ function getLlamaRnAdapter(): RuntimeAdapter | null {
     if (typeof llamaRn.initLlama !== 'function') {
       return null;
     }
+    const initLlama = llamaRn.initLlama;
 
     return {
       engine: 'llama.rn',
       createContext: async (modelPath: string) => {
-        const ctx = (await llamaRn.initLlama({
+        const ctx = (await initLlama({
           model: modelPath,
           n_ctx: DEFAULT_CONTEXT_SIZE,
         })) as {
@@ -76,10 +84,11 @@ function getLlamaRnAdapter(): RuntimeAdapter | null {
         if (typeof ctx.completion !== 'function') {
           throw new Error('llama.rn sem metodo completion');
         }
+        const completionFn = ctx.completion;
 
         return {
           infer: async (prompt: string, nPredict: number) => {
-            const completion = await ctx.completion?.({
+            const completion = await completionFn({
               prompt,
               n_predict: nPredict,
               temperature: 0.7,
@@ -132,10 +141,11 @@ function getReactNativeLlamaAdapter(): RuntimeAdapter | null {
         if (typeof ctx.completion !== 'function') {
           throw new Error('react-native-llama sem metodo completion');
         }
+        const completionFn = ctx.completion;
 
         return {
           infer: async (prompt: string, nPredict: number) => {
-            const completion = await ctx.completion?.({
+            const completion = await completionFn({
               prompt,
               n_predict: nPredict,
               temperature: 0.7,
@@ -164,19 +174,27 @@ export function getRuntimeState(): RuntimeState {
 
 export async function ensureRuntimeReady(): Promise<boolean> {
   if (runtimeState.status === 'ready' && runtimeContext) {
+    logInfo(TAG, 'ensureRuntimeReady: runtime ja pronto, reutilizando contexto');
     return true;
   }
 
   if (runtimeLoadPromise) {
+    logInfo(TAG, 'ensureRuntimeReady: carregamento em andamento, aguardando promessa existente');
     return runtimeLoadPromise;
   }
 
   runtimeLoadPromise = (async () => {
     runtimeState = {status: 'loading'};
-    logInfo(TAG, 'Tentando carregar runtime local');
+    logInfo(TAG, 'Tentativa de carregar runtime local iniciada');
 
     try {
+      logInfo(TAG, 'Checagem de modelo instalado iniciada');
       const modelState = await loadModelDownloadState();
+      logInfo(
+        TAG,
+        'Checagem de modelo instalado concluida',
+        `Status: ${modelState.status}\nPath: ${modelState.filePath ?? 'indisponivel'}`,
+      );
       if (modelState.status !== 'ready' || !modelState.filePath) {
         runtimeState = {status: 'not_loaded'};
         logWarn(
@@ -198,7 +216,13 @@ export async function ensureRuntimeReady(): Promise<boolean> {
         return false;
       }
 
+      logInfo(
+        TAG,
+        'Tentativa de criar contexto do runtime iniciada',
+        `Engine: ${adapter.engine}\nModelo: ${modelState.filePath}`,
+      );
       runtimeContext = await adapter.createContext(modelState.filePath);
+      logInfo(TAG, 'Tentativa de criar contexto do runtime concluida com sucesso');
       runtimeState = {
         status: 'ready',
         modelPath: modelState.filePath,
@@ -217,10 +241,11 @@ export async function ensureRuntimeReady(): Promise<boolean> {
         errorMessage,
       };
       runtimeContext = null;
-      logError(TAG, 'Falha ao carregar runtime', errorMessage);
+      logError(TAG, 'Falha ao carregar runtime', toErrorDetails(error));
       return false;
     } finally {
       runtimeLoadPromise = null;
+      logInfo(TAG, 'Fluxo de carregamento de runtime finalizado', `Status final: ${runtimeState.status}`);
     }
   })();
 
@@ -230,6 +255,7 @@ export async function ensureRuntimeReady(): Promise<boolean> {
 export async function inferWithLocalRuntime(messages: Message[]): Promise<string> {
   const prompt = buildPrompt(messages);
   if (!runtimeContext) {
+    logError(TAG, 'Inferencia solicitada sem runtimeContext');
     throw new Error('Runtime local indisponivel para inferencia');
   }
 
@@ -238,7 +264,18 @@ export async function inferWithLocalRuntime(messages: Message[]): Promise<string
     'Iniciando inferencia local',
     `Mensagens: ${messages.length}\nEngine: ${runtimeState.engine ?? 'desconhecida'}`,
   );
-  return runtimeContext.infer(prompt, DEFAULT_PREDICT_TOKENS);
+  try {
+    const response = await runtimeContext.infer(prompt, DEFAULT_PREDICT_TOKENS);
+    if (response === null || response === undefined) {
+      logWarn(TAG, 'Retorno da inferencia veio null/undefined');
+      throw new Error('Inferencia retornou valor nulo/indefinido');
+    }
+    logInfo(TAG, 'Retorno da inferencia local concluido', `Tamanho bruto: ${response.length}`);
+    return response;
+  } catch (error) {
+    logError(TAG, 'Erro durante inferencia local', toErrorDetails(error));
+    throw error;
+  }
 }
 
 export async function releaseRuntime(): Promise<void> {
