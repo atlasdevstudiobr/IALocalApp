@@ -198,10 +198,10 @@ function normalizeMessage(raw: Partial<Message> | null | undefined): Message | n
     return null;
   }
   const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : generateId();
-  const role =
-    raw.role === 'user' || raw.role === 'assistant' || raw.role === 'system'
-      ? raw.role
-      : 'assistant';
+  if (raw.role === 'system') {
+    return null;
+  }
+  const role = raw.role === 'user' || raw.role === 'assistant' ? raw.role : 'assistant';
   const content = typeof raw.content === 'string' ? raw.content : '';
   const timestamp = typeof raw.timestamp === 'number' && Number.isFinite(raw.timestamp)
     ? raw.timestamp

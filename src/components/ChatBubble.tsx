@@ -23,7 +23,7 @@ type InlineChunk =
 
 function parseInlineChunks(text: string): InlineChunk[] {
   const chunks: InlineChunk[] = [];
-  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*)/g;
+  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__)/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -101,6 +101,18 @@ function parseTextSegment(segment: string): MarkdownBlock[] {
         type: 'heading',
         level,
         text: headingMatch[2].trim(),
+      });
+      continue;
+    }
+
+    const subtitleMatch = line.match(/^([A-Z0-9][^:]{1,54}):$/);
+    if (subtitleMatch) {
+      flushParagraph();
+      flushList();
+      blocks.push({
+        type: 'heading',
+        level: 3,
+        text: subtitleMatch[1].trim(),
       });
       continue;
     }
@@ -275,13 +287,26 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
                     : block.level === 2
                     ? styles.heading2
                     : styles.heading3;
+                const headingContainerStyle =
+                  block.level === 1
+                    ? styles.headingBlockStrong
+                    : block.level === 2
+                    ? styles.headingBlockMedium
+                    : styles.headingBlockSoft;
                 return (
-                  <Text
+                  <View
                     key={`h-${blockIndex}`}
-                    selectable
-                    style={[styles.messageText, headingStyle, isError && styles.messageTextError]}>
-                    {renderInline(block.text, `h-${blockIndex}`)}
-                  </Text>
+                    style={[
+                      styles.headingBlock,
+                      headingContainerStyle,
+                      isError && styles.headingBlockError,
+                    ]}>
+                    <Text
+                      selectable
+                      style={[styles.messageText, headingStyle, isError && styles.messageTextError]}>
+                      {renderInline(block.text, `h-${blockIndex}`)}
+                    </Text>
+                  </View>
                 );
               }
 
@@ -290,7 +315,12 @@ export default function ChatBubble({message}: ChatBubbleProps): React.JSX.Elemen
                   <View key={`l-${blockIndex}`} style={styles.listBlock}>
                     {block.items.map((item, itemIndex) => (
                       <View key={`li-${blockIndex}-${itemIndex}`} style={styles.listRow}>
-                        <Text style={[styles.listMarker, isError && styles.messageTextError]}>
+                        <Text
+                          style={[
+                            styles.listMarker,
+                            block.ordered ? styles.listMarkerOrdered : styles.listMarkerBullet,
+                            isError && styles.messageTextError,
+                          ]}>
                           {block.ordered ? `${itemIndex + 1}.` : '\u2022'}
                         </Text>
                         <Text
@@ -402,51 +432,84 @@ const styles = StyleSheet.create({
     fontSize: fonts.sizes.base,
     lineHeight: 22,
   },
-  messageBody: {},
+  messageBody: {
+    paddingTop: 2,
+  },
   paragraphText: {
     fontSize: fonts.sizes.base,
     lineHeight: 24,
+    marginBottom: spacing.md,
+  },
+  headingBlock: {
+    marginTop: spacing.xs,
     marginBottom: spacing.sm,
+    paddingLeft: spacing.sm,
+    borderLeftWidth: 3,
+    borderRadius: radius.sm,
+  },
+  headingBlockStrong: {
+    borderLeftColor: colors.primary,
+    backgroundColor: 'rgba(16, 163, 127, 0.12)',
+    paddingVertical: spacing.xs,
+    paddingRight: spacing.xs,
+  },
+  headingBlockMedium: {
+    borderLeftColor: colors.primaryDark,
+    backgroundColor: 'rgba(16, 163, 127, 0.08)',
+    paddingVertical: spacing.xs,
+    paddingRight: spacing.xs,
+  },
+  headingBlockSoft: {
+    borderLeftColor: colors.border,
+  },
+  headingBlockError: {
+    borderLeftColor: colors.danger,
   },
   heading1: {
-    fontSize: 25,
-    lineHeight: 31,
+    fontSize: 28,
+    lineHeight: 34,
     fontWeight: '800',
-    marginTop: spacing.xs,
-    marginBottom: spacing.xs,
+    color: colors.primary,
+    marginBottom: 2,
   },
   heading2: {
-    fontSize: 21,
-    lineHeight: 27,
+    fontSize: 23,
+    lineHeight: 30,
     fontWeight: '700',
-    marginTop: spacing.xs,
-    marginBottom: spacing.xs,
+    marginBottom: 2,
   },
   heading3: {
-    fontSize: 18,
-    lineHeight: 24,
+    fontSize: 19,
+    lineHeight: 26,
     fontWeight: '700',
-    marginTop: spacing.xs,
-    marginBottom: spacing.xs,
+    color: colors.textSecondary,
   },
   listBlock: {
-    marginBottom: spacing.sm,
+    marginBottom: spacing.md,
+    paddingLeft: 2,
   },
   listRow: {
     flexDirection: 'row',
     alignItems: 'flex-start',
-    marginBottom: spacing.xs,
+    marginBottom: spacing.sm,
   },
   listMarker: {
-    color: colors.textSecondary,
+    color: colors.text,
     fontSize: fonts.sizes.base,
-    lineHeight: 24,
-    minWidth: 18,
+    lineHeight: 25,
+    minWidth: 22,
     fontWeight: '700',
+    marginTop: 1,
+  },
+  listMarkerOrdered: {
+    color: colors.primary,
+  },
+  listMarkerBullet: {
+    color: colors.textSecondary,
   },
   listText: {
     flex: 1,
-    lineHeight: 24,
+    lineHeight: 25,
   },
   codeBlock: {
     backgroundColor: colors.surfaceElevated,
@@ -505,7 +568,10 @@ const styles = StyleSheet.create({
   inlineCode: {
     color: colors.primary,
     backgroundColor: colors.surfaceElevated,
-    fontSize: 14,
+    fontSize: 13,
+    borderRadius: radius.sm,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
     fontFamily: Platform.select({
       ios: 'Menlo',
       android: 'monospace',

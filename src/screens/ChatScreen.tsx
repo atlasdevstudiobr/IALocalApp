@@ -64,6 +64,10 @@ export default function ChatScreen(): React.JSX.Element {
 
   const conversation = state.conversations.find(c => c.id === conversationId) ?? null;
   const messages = Array.isArray(conversation?.messages) ? conversation.messages : [];
+  const visibleMessages = useMemo(
+    () => messages.filter(message => message?.role === 'user' || message?.role === 'assistant'),
+    [messages],
+  );
   const isLoading = state.isLoading;
   // Em Android, inverted + maintainVisibleContentPosition pode causar crash nativo da lista.
   const maintainVisibleContentPosition =
@@ -73,9 +77,9 @@ export default function ChatScreen(): React.JSX.Element {
     logInfo(
       TAG,
       'Render do ChatScreen concluido',
-      `render=${renderCountRef.current} conversationId=${conversationId || 'none'} messages=${messages.length} currentConversationId=${state.currentConversationId ?? 'null'}`,
+      `render=${renderCountRef.current} conversationId=${conversationId || 'none'} visibleMessages=${visibleMessages.length} currentConversationId=${state.currentConversationId ?? 'null'}`,
     );
-  }, [conversationId, messages.length, state.currentConversationId]);
+  }, [conversationId, visibleMessages.length, state.currentConversationId]);
 
   // Sync current conversation when navigating directly to a chat
   useEffect(() => {
@@ -133,7 +137,7 @@ export default function ChatScreen(): React.JSX.Element {
       logInfo(TAG, 'Criacao da mensagem placeholder do assistente concluida');
       logInfo(TAG, 'Persistencia da mensagem placeholder disparada (autosave assincrono)');
 
-      const allMessages = [...messages, {
+      const allMessages = [...visibleMessages, {
         id: 'temp-user',
         role: 'user' as const,
         content: trimmed,
@@ -178,7 +182,7 @@ export default function ChatScreen(): React.JSX.Element {
     inputText,
     isLoading,
     conversationId,
-    messages,
+    visibleMessages,
     addMessage,
     updateLastMessage,
     setLoading,
@@ -235,7 +239,7 @@ export default function ChatScreen(): React.JSX.Element {
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         keyboardVerticalOffset={0}>
 
-        {messages.length === 0 ? (
+        {visibleMessages.length === 0 ? (
           <View style={styles.emptyChat}>
             <View style={styles.emptyChatIcon}>
               <Text style={styles.emptyChatIconText}>A</Text>
@@ -248,7 +252,7 @@ export default function ChatScreen(): React.JSX.Element {
         ) : (
           <FlatList
             ref={flatListRef}
-            data={[...messages].reverse()}
+            data={[...visibleMessages].reverse()}
             renderItem={renderMessage}
             keyExtractor={keyExtractor}
             inverted
