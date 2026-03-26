@@ -21,7 +21,7 @@ import {
   startModelDownload,
 } from '../services/modelDownloadService';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
 const RN_VERSION = '0.73.6';
 
 export default function SettingsScreen(): React.JSX.Element {

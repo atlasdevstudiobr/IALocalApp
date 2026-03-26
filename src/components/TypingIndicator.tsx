@@ -15,12 +15,12 @@ export default function TypingIndicator(): React.JSX.Element {
           Animated.timing(dot, {
             toValue: 1,
             duration: 350,
-            useNativeDriver: true,
+            useNativeDriver: false,
           }),
           Animated.timing(dot, {
             toValue: 0,
             duration: 350,
-            useNativeDriver: true,
+            useNativeDriver: false,
           }),
           Animated.delay(700 - delay),
         ]),

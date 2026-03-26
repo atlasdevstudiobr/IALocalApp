@@ -1,5 +1,7 @@
-import {NativeModules} from 'react-native';
+import {NativeModules, Platform} from 'react-native';
+import ReactNativeBlobUtil from 'react-native-blob-util';
 import {initLlama, releaseAllLlama, type LlamaContext} from 'llama.rn';
+import {LOCAL_MODEL_MIN_VALID_SIZE_BYTES} from '../config/modelConfig';
 import {Message} from '../types';
 import * as LogService from './logService';
 
@@ -7,8 +9,15 @@ const TAG = 'LocalRuntimeService';
 const EXPLICIT_RUNTIME_ENGINE = 'llama.rn';
 const EXPLICIT_RUNTIME_STRATEGY = 'static-import';
 
-const DEFAULT_CONTEXT_SIZE = 2048;
-const DEFAULT_PREDICT_TOKENS = 384;
+const DEFAULT_CONTEXT_SIZE = 1024;
+const DEFAULT_BATCH_SIZE = 128;
+const DEFAULT_PREDICT_TOKENS = 192;
+const MAX_PROMPT_MESSAGES = 12;
+const MAX_PROMPT_CHARS = 8000;
+const MIN_ANDROID_TOTAL_RAM_KB = 5 * 1024 * 1024;
+const KNOWN_UNSUPPORTED_SOC_MARKERS = ['sm7450'];
+const CPU_INFO_PATH = '/proc/cpuinfo';
+const MEM_INFO_PATH = '/proc/meminfo';
 
 export type RuntimeStatus = 'not_loaded' | 'loading' | 'ready' | 'error';
 
@@ -35,6 +44,7 @@ let runtimeState: RuntimeState = {status: 'not_loaded'};
 let runtimeContext: RuntimeContext | null = null;
 let runtimeLoadPromise: Promise<boolean> | null = null;
 let modelDownloadStateLoader: ModelDownloadStateLoader | null = null;
+let runtimeCompatibilityProbePromise: Promise<string | null> | null = null;
 
 function logInfo(tag: string, message: string, details?: string): void {
   try {
@@ -123,6 +133,121 @@ function normalizeModelPath(modelPath: string): string {
   return `file://${modelPath}`;
 }
 
+function normalizePromptMessageContent(content: unknown): string {
+  if (typeof content !== 'string') {
+    return '';
+  }
+  return content.replace(/\s+/g, ' ').trim();
+}
+
+async function readProcFile(path: string): Promise<string | null> {
+  try {
+    const value = await ReactNativeBlobUtil.fs.readFile(path, 'utf8');
+    return typeof value === 'string' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseMemTotalKb(memInfoRaw: string | null): number | null {
+  if (!memInfoRaw) {
+    return null;
+  }
+  const match = memInfoRaw.match(/^MemTotal:\s+(\d+)\s+kB$/im);
+  if (!match) {
+    return null;
+  }
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function readPlatformConstant(constants: Record<string, unknown>, key: string): string {
+  const value = constants[key];
+  return typeof value === 'string' ? value : '';
+}
+
+function buildCompatibilityProbeText(cpuInfo: string | null): string {
+  const constants = Platform.constants as unknown as Record<string, unknown>;
+  const model = readPlatformConstant(constants, 'Model');
+  const fingerprint = readPlatformConstant(constants, 'Fingerprint');
+  const manufacturer = readPlatformConstant(constants, 'Manufacturer');
+  const brand = readPlatformConstant(constants, 'Brand');
+  return `${model}\n${manufacturer}\n${brand}\n${fingerprint}\n${cpuInfo ?? ''}`.toLowerCase();
+}
+
+async function detectAndroidRuntimeCompatibilityBlockReason(): Promise<string | null> {
+  if (Platform.OS !== 'android') {
+    return null;
+  }
+
+  const [cpuInfo, memInfo] = await Promise.all([
+    readProcFile(CPU_INFO_PATH),
+    readProcFile(MEM_INFO_PATH),
+  ]);
+
+  const totalMemKb = parseMemTotalKb(memInfo);
+  if (totalMemKb !== null && totalMemKb < MIN_ANDROID_TOTAL_RAM_KB) {
+    const totalMemGb = (totalMemKb / (1024 * 1024)).toFixed(1);
+    const minMemGb = (MIN_ANDROID_TOTAL_RAM_KB / (1024 * 1024)).toFixed(1);
+    return `Memoria insuficiente para inferencia local segura (${totalMemGb} GB detectado, minimo recomendado ${minMemGb} GB).`;
+  }
+
+  const probeText = buildCompatibilityProbeText(cpuInfo);
+  const unsupportedSoc = KNOWN_UNSUPPORTED_SOC_MARKERS.find(marker => probeText.includes(marker));
+  if (unsupportedSoc) {
+    return `SoC Android com historico de crash nativo detectado (${unsupportedSoc.toUpperCase()}). Inferencia local foi bloqueada preventivamente para evitar fechamento do app.`;
+  }
+
+  return null;
+}
+
+async function getRuntimeCompatibilityBlockReason(): Promise<string | null> {
+  if (!runtimeCompatibilityProbePromise) {
+    runtimeCompatibilityProbePromise = detectAndroidRuntimeCompatibilityBlockReason();
+  }
+  return runtimeCompatibilityProbePromise;
+}
+
+interface RuntimeModelValidationResult {
+  valid: boolean;
+  size: number;
+  reason?: string;
+}
+
+async function validateRuntimeModelFile(modelPath: string): Promise<RuntimeModelValidationResult> {
+  try {
+    const exists = await ReactNativeBlobUtil.fs.exists(modelPath);
+    if (!exists) {
+      return {
+        valid: false,
+        size: 0,
+        reason: `Arquivo do modelo nao encontrado em ${modelPath}`,
+      };
+    }
+
+    const stat = await ReactNativeBlobUtil.fs.stat(modelPath);
+    const size = Number(stat.size) || 0;
+
+    if (size < LOCAL_MODEL_MIN_VALID_SIZE_BYTES) {
+      return {
+        valid: false,
+        size,
+        reason:
+          `Arquivo do modelo possivelmente truncado (${size} bytes). ` +
+          `Minimo esperado: ${LOCAL_MODEL_MIN_VALID_SIZE_BYTES} bytes.`,
+      };
+    }
+
+    return {valid: true, size};
+  } catch (error) {
+    return {
+      valid: false,
+      size: 0,
+      reason: `Falha ao validar arquivo do modelo: ${toErrorMessage(error)}`,
+    };
+  }
+}
+
 async function loadModelDownloadStateFromLoader(): Promise<ModelDownloadStateSnapshot> {
   if (typeof modelDownloadStateLoader !== 'function') {
     throw new Error(
@@ -138,7 +263,8 @@ async function loadModelDownloadStateFromLoader(): Promise<ModelDownloadStateSna
 }
 
 function buildPrompt(messages: Message[]): string {
-  const prompt = messages
+  const recentMessages = messages.slice(-MAX_PROMPT_MESSAGES);
+  const promptBody = recentMessages
     .map(message => {
       const role =
         message.role === 'user'
@@ -146,11 +272,19 @@ function buildPrompt(messages: Message[]): string {
           : message.role === 'assistant'
           ? 'Assistente'
           : 'Sistema';
-      return `${role}: ${message.content.trim()}`;
+      return `${role}: ${normalizePromptMessageContent(message.content)}`;
     })
     .join('\n\n');
 
-  return `${prompt}\n\nAssistente:`;
+  if (!promptBody) {
+    return 'Assistente:';
+  }
+
+  const prompt = `${promptBody}\n\nAssistente:`;
+  if (prompt.length <= MAX_PROMPT_CHARS) {
+    return prompt;
+  }
+  return prompt.slice(prompt.length - MAX_PROMPT_CHARS);
 }
 
 async function createLlamaRuntimeContext(modelPath: string): Promise<RuntimeContext> {
@@ -165,6 +299,9 @@ async function createLlamaRuntimeContext(modelPath: string): Promise<RuntimeCont
   const context = (await initLlama({
     model: runtimeModelPath,
     n_ctx: DEFAULT_CONTEXT_SIZE,
+    n_batch: DEFAULT_BATCH_SIZE,
+    use_mmap: true,
+    use_mlock: false,
   })) as LlamaContext;
 
   if (!context || typeof context.completion !== 'function') {
@@ -177,6 +314,8 @@ async function createLlamaRuntimeContext(modelPath: string): Promise<RuntimeCont
         prompt,
         n_predict: nPredict,
         temperature: 0.7,
+        top_p: 0.9,
+        stop: ['\nUsuario:', '\nSistema:', '<|im_end|>', '</s>'],
       })) as {text?: unknown};
 
       const text = completion?.text;
@@ -220,8 +359,21 @@ export async function ensureRuntimeReady(): Promise<boolean> {
     );
 
     let resolvedModelPath: string | undefined;
+    let validatedModelSize = 0;
 
     try {
+      const compatibilityBlockReason = await getRuntimeCompatibilityBlockReason();
+      if (compatibilityBlockReason) {
+        runtimeState = {
+          status: 'not_loaded',
+          engine: EXPLICIT_RUNTIME_ENGINE,
+          errorMessage: compatibilityBlockReason,
+        };
+        runtimeContext = null;
+        logWarn(TAG, 'Runtime bloqueado por compatibilidade preventiva', compatibilityBlockReason);
+        return false;
+      }
+
       logInfo(TAG, 'Checagem de modelo instalado iniciada');
       const modelState = await loadModelDownloadStateFromLoader();
       resolvedModelPath = modelState.filePath;
@@ -241,6 +393,24 @@ export async function ensureRuntimeReady(): Promise<boolean> {
         );
         return false;
       }
+
+      const modelValidation = await validateRuntimeModelFile(modelState.filePath);
+      if (!modelValidation.valid) {
+        runtimeState = {
+          status: 'not_loaded',
+          modelPath: modelState.filePath,
+          engine: EXPLICIT_RUNTIME_ENGINE,
+          errorMessage: modelValidation.reason,
+        };
+        runtimeContext = null;
+        logWarn(
+          TAG,
+          'Runtime nao carregado: arquivo de modelo invalido para inferencia segura',
+          `Motivo: ${modelValidation.reason ?? 'desconhecido'}`,
+        );
+        return false;
+      }
+      validatedModelSize = modelValidation.size;
 
       if (!isNativeRNLlamaModuleAvailable()) {
         const reason = buildNativeBridgeUnavailableReason();
@@ -264,7 +434,7 @@ export async function ensureRuntimeReady(): Promise<boolean> {
       logInfo(
         TAG,
         'Runtime local carregado com sucesso',
-        `Engine: ${EXPLICIT_RUNTIME_ENGINE}\nModelo: ${modelState.filePath}`,
+        `Engine: ${EXPLICIT_RUNTIME_ENGINE}\nModelo: ${modelState.filePath}\nTamanho validado: ${validatedModelSize} bytes`,
       );
       return true;
     } catch (error) {

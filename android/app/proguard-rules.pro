@@ -41,6 +41,9 @@
 # React Native Screens
 -keep class com.swmansion.rnscreens.** { *; }
 
+# llama.rn
+-keep class com.rnllama.** { *; }
+
 # Suppress warnings
 -dontwarn com.facebook.react.**
 -dontwarn okhttp3.**

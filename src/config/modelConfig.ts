@@ -15,5 +15,7 @@ export const LOCAL_MODEL_ESTIMATED_SIZE_BYTES = 2 * 1024 * 1024 * 1024;
 
 /**
  * Limite minimo plausivel para evitar marcar arquivos truncados como validos.
+ * O arquivo oficial costuma ter ~2.10 GB; usamos 85% do estimado como limite seguro.
  */
-export const LOCAL_MODEL_MIN_VALID_SIZE_BYTES = 1024 * 1024 * 1024;
+export const LOCAL_MODEL_MIN_VALID_SIZE_BYTES =
+  Math.floor(LOCAL_MODEL_ESTIMATED_SIZE_BYTES * 0.85);
