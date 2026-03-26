@@ -1,6 +1,7 @@
 import {MessageSource} from '../types';
 
-const MAX_VISIBLE_SOURCES = 3;
+const DEFAULT_MAX_VISIBLE_SOURCES = 3;
+const PLACEHOLDER_LABELS = new Set(['fonte', 'source', 'placeholder', 'site', 'link']);
 
 function decodeBasicHtmlEntities(value: string): string {
   return value
@@ -13,18 +14,31 @@ function decodeBasicHtmlEntities(value: string): string {
 
 function normalizeTitle(rawTitle: string): string {
   const title = decodeBasicHtmlEntities(rawTitle).replace(/\s+/g, ' ').trim();
-  if (!title) {
-    return 'Fonte';
-  }
   return title;
 }
 
 function normalizeUrl(rawUrl: string): string {
   const decoded = decodeBasicHtmlEntities(rawUrl).trim();
-  if (decoded.startsWith('http://') || decoded.startsWith('https://')) {
-    return decoded;
+  if (!decoded) {
+    return '';
   }
-  return `https://${decoded.replace(/^\/+/, '')}`;
+  const withProtocol =
+    decoded.startsWith('http://') || decoded.startsWith('https://')
+      ? decoded
+      : `https://${decoded.replace(/^\/+/, '')}`;
+  try {
+    const parsed = new URL(withProtocol);
+    if (
+      (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+      !parsed.hostname ||
+      !parsed.hostname.includes('.')
+    ) {
+      return '';
+    }
+    return parsed.toString();
+  } catch {
+    return '';
+  }
 }
 
 function toSiteNameFromUrl(url: string): string {
@@ -32,10 +46,28 @@ function toSiteNameFromUrl(url: string): string {
     const parsed = new URL(url);
     const host = parsed.hostname.replace(/^www\./i, '');
     const clean = host.replace(/[:/]+$/g, '');
-    return clean || 'fonte';
+    return clean;
   } catch {
-    return 'fonte';
+    return '';
   }
+}
+
+function isPlaceholderValue(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  const compact = normalized.replace(/[\s._-]+/g, '');
+  if (!compact) {
+    return true;
+  }
+  if (PLACEHOLDER_LABELS.has(normalized) || PLACEHOLDER_LABELS.has(compact)) {
+    return true;
+  }
+  if (compact.includes('placeholder')) {
+    return true;
+  }
+  return false;
 }
 
 export interface RawSourceCandidate {
@@ -43,24 +75,43 @@ export interface RawSourceCandidate {
   url: string;
 }
 
-export function buildSourceAttributions(candidates: RawSourceCandidate[]): MessageSource[] {
+export function buildSourceAttributions(
+  candidates: RawSourceCandidate[],
+  maxVisibleSources = DEFAULT_MAX_VISIBLE_SOURCES,
+): MessageSource[] {
+  const safeMaxVisibleSources =
+    Number.isFinite(maxVisibleSources) && maxVisibleSources > 0
+      ? Math.min(Math.floor(maxVisibleSources), DEFAULT_MAX_VISIBLE_SOURCES)
+      : DEFAULT_MAX_VISIBLE_SOURCES;
   const uniqueByUrl = new Set<string>();
   const results: MessageSource[] = [];
 
   for (const candidate of candidates) {
     const url = normalizeUrl(candidate.url);
-    if (!url || uniqueByUrl.has(url)) {
+    const dedupeKey = url.toLowerCase();
+    if (!url || uniqueByUrl.has(dedupeKey)) {
       continue;
     }
-    uniqueByUrl.add(url);
+    uniqueByUrl.add(dedupeKey);
+
+    const siteName = toSiteNameFromUrl(url);
+    if (!siteName || isPlaceholderValue(siteName)) {
+      continue;
+    }
+    const normalizedTitle = normalizeTitle(candidate.title);
+    const title =
+      normalizedTitle && !isPlaceholderValue(normalizedTitle) ? normalizedTitle : siteName;
+    if (!title || isPlaceholderValue(title)) {
+      continue;
+    }
 
     results.push({
-      title: normalizeTitle(candidate.title),
+      title,
       url,
-      siteName: toSiteNameFromUrl(url),
+      siteName,
     });
 
-    if (results.length >= MAX_VISIBLE_SOURCES) {
+    if (results.length >= safeMaxVisibleSources) {
       break;
     }
   }

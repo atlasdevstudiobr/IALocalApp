@@ -29,8 +29,8 @@ type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
 const TAG = 'ChatScreen';
 const SEND_FALLBACK_MESSAGE = 'Falha ao carregar o runtime local. Veja os logs.';
-const STREAM_UPDATE_INTERVAL_MS = 95;
-const MIN_STREAM_UPDATE_DELTA_CHARS = 14;
+const STREAM_ANIMATION_FRAME_MS = 28;
+const STREAM_MAX_CHARS_PER_TICK = 8;
 const MAX_RUNTIME_MESSAGES = 12;
 
 function toErrorDetails(error: unknown): string {
@@ -107,52 +107,69 @@ export default function ChatScreen(): React.JSX.Element {
     let targetConversationId = conversationId;
     let assistantPlaceholderCreated = false;
     let streamTimer: ReturnType<typeof setTimeout> | null = null;
-    let pendingStreamText = '';
-    let lastStreamPushAt = 0;
-    let lastPushedStreamText = '';
+    let streamTargetText = '';
+    let streamDisplayedText = '';
+    let streamAnimationRunning = false;
 
-    const flushStreamUpdate = () => {
-      if (!targetConversationId || !assistantPlaceholderCreated || !pendingStreamText) {
+    const stopStreamAnimation = () => {
+      if (streamTimer) {
+        clearTimeout(streamTimer);
         streamTimer = null;
+      }
+      streamAnimationRunning = false;
+    };
+
+    const getCharsPerTick = (): number => {
+      const backlog = streamTargetText.length - streamDisplayedText.length;
+      if (backlog >= 120) {
+        return STREAM_MAX_CHARS_PER_TICK;
+      }
+      if (backlog >= 64) {
+        return 6;
+      }
+      if (backlog >= 24) {
+        return 4;
+      }
+      return 2;
+    };
+
+    const animateStreamStep = () => {
+      if (!targetConversationId || !assistantPlaceholderCreated) {
+        stopStreamAnimation();
         return;
       }
-      if (pendingStreamText === lastPushedStreamText) {
-        streamTimer = null;
+      if (streamDisplayedText.length >= streamTargetText.length) {
+        stopStreamAnimation();
         return;
       }
-      updateLastMessage(targetConversationId, pendingStreamText, {touchUpdatedAt: false});
-      lastPushedStreamText = pendingStreamText;
-      lastStreamPushAt = Date.now();
-      streamTimer = null;
+
+      const nextLength = Math.min(
+        streamTargetText.length,
+        streamDisplayedText.length + getCharsPerTick(),
+      );
+      streamDisplayedText = streamTargetText.slice(0, nextLength);
+      updateLastMessage(targetConversationId, streamDisplayedText, {touchUpdatedAt: false});
+
+      if (streamDisplayedText.length >= streamTargetText.length) {
+        stopStreamAnimation();
+        return;
+      }
+      streamTimer = setTimeout(animateStreamStep, STREAM_ANIMATION_FRAME_MS);
     };
 
     const scheduleStreamUpdate = (partialText: string) => {
-      pendingStreamText = partialText;
-      const now = Date.now();
-      const elapsed = now - lastStreamPushAt;
-      const charDelta = pendingStreamText.length - lastPushedStreamText.length;
-      const isFirstVisibleToken = lastPushedStreamText.length === 0 && pendingStreamText.length > 0;
-      const hasMeaningfulDelta = charDelta >= MIN_STREAM_UPDATE_DELTA_CHARS;
-      if (elapsed >= STREAM_UPDATE_INTERVAL_MS) {
-        if (streamTimer) {
-          clearTimeout(streamTimer);
-          streamTimer = null;
-        }
-        flushStreamUpdate();
+      if (!partialText) {
         return;
       }
-      if (isFirstVisibleToken || hasMeaningfulDelta) {
-        if (streamTimer) {
-          clearTimeout(streamTimer);
-          streamTimer = null;
-        }
-        flushStreamUpdate();
+      const nextTarget = partialText;
+      if (nextTarget.length < streamTargetText.length && streamTargetText.startsWith(nextTarget)) {
         return;
       }
-      if (streamTimer) {
-        return;
+      streamTargetText = nextTarget;
+      if (!streamAnimationRunning) {
+        streamAnimationRunning = true;
+        animateStreamStep();
       }
-      streamTimer = setTimeout(flushStreamUpdate, STREAM_UPDATE_INTERVAL_MS - elapsed);
     };
 
     try {
@@ -194,11 +211,7 @@ export default function ChatScreen(): React.JSX.Element {
           scheduleStreamUpdate(partialText);
         },
       );
-      if (streamTimer) {
-        clearTimeout(streamTimer);
-        streamTimer = null;
-      }
-      flushStreamUpdate();
+      stopStreamAnimation();
 
       if (!responsePackage.text) {
         logError(TAG, 'generateResponsePackageStream retornou texto vazio no ChatScreen');
@@ -217,10 +230,7 @@ export default function ChatScreen(): React.JSX.Element {
       });
     } catch (error) {
       logError(TAG, 'Catch no fluxo de envio do chat', toErrorDetails(error));
-      if (streamTimer) {
-        clearTimeout(streamTimer);
-        streamTimer = null;
-      }
+      stopStreamAnimation();
       if (targetConversationId) {
         if (assistantPlaceholderCreated) {
           updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, {

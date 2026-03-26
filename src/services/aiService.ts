@@ -10,9 +10,9 @@ import {
   RuntimeStatus,
 } from './localRuntimeService';
 import {loadLocalSafetyDisabled} from './safetySettingsService';
-import {classifySearchDecision} from './searchDecisionService';
-import {searchWeb} from './webSearchService';
-import {buildPromptAugmentation, composeAnswer} from './answerComposerService';
+import {classifySearchDecision, isFastWebFactQuery} from './searchDecisionService';
+import {searchWeb, WebSearchResult} from './webSearchService';
+import {buildFastWebAnswer, buildPromptAugmentation, composeAnswer} from './answerComposerService';
 
 const TAG = 'AIService';
 
@@ -60,6 +60,15 @@ const INTERNAL_PERSONA_PATTERN = /(?:voce|você)\s+e\s+o\s+alfa\s+ai/i;
 const TECHNICAL_LEAK_LINE_PATTERN =
   /\b(n_predict|stopped_limit|tokens_predicted|context_full|prompt chars|last user chars|contexto usado|engine:\s*llama\.rn)\b/i;
 const WARMUP_COOLDOWN_MS = 8 * 60 * 1000;
+const FAST_WEB_FIRST_WAIT_MS = 1700;
+const WEB_RESULT_WAIT_MS = 1900;
+const WEB_RESULT_RECOVERY_WAIT_MS = 900;
+const DETERMINISTIC_TIME_QUERY_PATTERN =
+  /\b(que ano estamos|ano atual|em que ano estamos|data de hoje|qual a data de hoje|que dia e hoje)\b/i;
+const NON_DETERMINISTIC_TIME_TERMS_PATTERN =
+  /\b(d[o\u00F3]lar|euro|bitcoin|btc|presidente|governador|ministro|prefeito|clima|temperatura|not[i\u00ED]cia)\b/i;
+const INCOMPLETE_ENDING_PATTERN =
+  /\b(de|do|da|dos|das|para|com|sobre|que|e|ou|em|no|na|nos|nas|por|ao|aos|a|o)\.?$/i;
 let runtimeBindingsInitialized = false;
 let warmupRuntimePromise: Promise<void> | null = null;
 let lastWarmupAt = 0;
@@ -113,6 +122,44 @@ function toErrorDetails(error: unknown): string {
     return `${error.message}\n${error.stack ?? 'stack indisponivel'}`;
   }
   return String(error);
+}
+
+async function waitPromiseWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<{value?: T; timedOut: boolean}> {
+  const safeTimeoutMs = Math.max(250, Math.floor(timeoutMs));
+  const timeoutToken = Symbol('timeout');
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const raced = await Promise.race<T | typeof timeoutToken>([
+      promise,
+      new Promise<typeof timeoutToken>(resolve => {
+        timeoutId = setTimeout(() => {
+          resolve(timeoutToken);
+        }, safeTimeoutMs);
+      }),
+    ]);
+    if (raced === timeoutToken) {
+      return {timedOut: true};
+    }
+    return {value: raced, timedOut: false};
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+function isDeterministicTimeQuery(query: string): boolean {
+  const normalized = query.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!normalized || normalized.length > 64) {
+    return false;
+  }
+  if (!DETERMINISTIC_TIME_QUERY_PATTERN.test(normalized)) {
+    return false;
+  }
+  return !NON_DETERMINISTIC_TIME_TERMS_PATTERN.test(normalized);
 }
 
 function countPromptLeakSignals(content: string): number {
@@ -283,12 +330,16 @@ function keepCasualReplyConcise(response: string, lastUserContent: string): stri
   }
 
   const firstParagraph = response.split(/\n{2,}/)[0].trim();
-  if (firstParagraph.length >= 8 && firstParagraph.length <= 180) {
+  if (
+    firstParagraph.length >= 8 &&
+    firstParagraph.length <= 180 &&
+    !isLikelyTruncatedEnding(firstParagraph)
+  ) {
     return firstParagraph;
   }
 
   const firstSentence = response.match(/^(.{1,180}?[.!?])(?:\s|$)/);
-  if (firstSentence?.[1]) {
+  if (firstSentence?.[1] && !isLikelyTruncatedEnding(firstSentence[1])) {
     return firstSentence[1].trim();
   }
 
@@ -316,7 +367,11 @@ function keepShortQuestionReplyConcise(response: string, lastUserContent: string
   }
 
   const firstParagraph = response.split(/\n{2,}/)[0].trim();
-  if (firstParagraph.length >= 8 && firstParagraph.length <= 180) {
+  if (
+    firstParagraph.length >= 8 &&
+    firstParagraph.length <= 180 &&
+    !isLikelyTruncatedEnding(firstParagraph)
+  ) {
     return firstParagraph;
   }
 
@@ -326,7 +381,11 @@ function keepShortQuestionReplyConcise(response: string, lastUserContent: string
       .slice(0, 2)
       .join(' ')
       .trim();
-    if (firstTwo.length >= 8 && firstTwo.length <= 180) {
+    if (
+      firstTwo.length >= 8 &&
+      firstTwo.length <= 180 &&
+      !isLikelyTruncatedEnding(firstTwo)
+    ) {
       return firstTwo;
     }
   }
@@ -352,7 +411,11 @@ function keepBriefPromptReplyConcise(response: string, lastUserContent: string):
   }
 
   const firstParagraph = response.split(/\n{2,}/)[0].trim();
-  if (firstParagraph.length >= 8 && firstParagraph.length <= 180) {
+  if (
+    firstParagraph.length >= 8 &&
+    firstParagraph.length <= 180 &&
+    !isLikelyTruncatedEnding(firstParagraph)
+  ) {
     return firstParagraph;
   }
 
@@ -411,6 +474,21 @@ function hasUnclosedCodeFence(content: string): boolean {
   return Boolean(fences && fences.length % 2 !== 0);
 }
 
+function isLikelyTruncatedEnding(content: string): boolean {
+  const normalized = content.trim();
+  if (!normalized) {
+    return true;
+  }
+  if (hasUnclosedCodeFence(normalized)) {
+    return true;
+  }
+  if (!/[.!?`)]$/.test(normalized)) {
+    return normalized.length >= 28;
+  }
+  const tail = normalized.slice(Math.max(0, normalized.length - 24));
+  return INCOMPLETE_ENDING_PATTERN.test(tail);
+}
+
 function ensureNaturalResponseEnding(response: string): string {
   let normalized = response.trim();
   if (!normalized) {
@@ -434,6 +512,9 @@ function ensureNaturalResponseEnding(response: string): string {
 
 function buildFinalResponse(rawResponse: string, lastUserContent: string): string {
   const normalizedResponse = softenInstitutionalOpeners(normalizeModelResponse(rawResponse));
+  if (!normalizedResponse) {
+    return '';
+  }
   const conciseResponse = keepBriefPromptReplyConcise(
     keepShortQuestionReplyConcise(
       keepCasualReplyConcise(normalizedResponse, lastUserContent),
@@ -441,7 +522,17 @@ function buildFinalResponse(rawResponse: string, lastUserContent: string): strin
     ),
     lastUserContent,
   );
-  return normalizeModelResponse(ensureNaturalResponseEnding(conciseResponse));
+  const finalized = normalizeModelResponse(ensureNaturalResponseEnding(conciseResponse));
+  if (!finalized) {
+    return normalizeModelResponse(ensureNaturalResponseEnding(normalizedResponse));
+  }
+  if (
+    isLikelyTruncatedEnding(finalized) &&
+    normalizedResponse.length >= finalized.length + 36
+  ) {
+    return normalizeModelResponse(ensureNaturalResponseEnding(normalizedResponse));
+  }
+  return finalized;
 }
 
 function buildPartialResponse(rawPartial: string): string {
@@ -526,14 +617,67 @@ export async function generateResponsePackageStream(
     `Last message role: ${lastMessage?.role ?? 'none'}\nlocalSafetyDisabled=${localSafetyDisabled}\nsearchDecision=${decisionResult.decision}`,
   );
 
+  const shouldSearchWeb =
+    decisionResult.decision === 'local_plus_web' && Boolean(decisionResult.query);
+  const deterministicFastAnswer =
+    shouldSearchWeb && isDeterministicTimeQuery(decisionResult.query)
+      ? buildFastWebAnswer(decisionResult.query)
+      : null;
+  if (deterministicFastAnswer) {
+    return {
+      text: deterministicFastAnswer,
+      sources: [],
+      searchDecision: decisionResult.decision,
+      webValidationStatus: 'not_needed',
+    };
+  }
+
+  const fastWebCandidate = shouldSearchWeb ? isFastWebFactQuery(decisionResult.query) : false;
   const runtimeReadyPromise = ensureRuntimeReady();
-  const webSearchPromise =
-    decisionResult.decision === 'local_plus_web' && decisionResult.query
-      ? searchWeb(decisionResult.query)
-      : Promise.resolve(undefined);
+  const webSearchPromise: Promise<WebSearchResult | undefined> | undefined = shouldSearchWeb
+    ? searchWeb(decisionResult.query, {
+        mode: fastWebCandidate ? 'fast' : 'standard',
+      }).catch(error => {
+        logError(TAG, 'Busca web retornou erro nao tratado', toErrorDetails(error));
+        return undefined;
+      })
+    : undefined;
 
   let runtimeReady = false;
-  let webResult = await webSearchPromise;
+  let webResult: WebSearchResult | undefined;
+
+  if (fastWebCandidate && webSearchPromise) {
+    const quickWebAttempt = await waitPromiseWithTimeout(webSearchPromise, FAST_WEB_FIRST_WAIT_MS);
+    if (!quickWebAttempt.timedOut) {
+      webResult = quickWebAttempt.value;
+      const quickAnswer = buildFastWebAnswer(decisionResult.query, webResult);
+      if (quickAnswer) {
+        const composedQuick = composeAnswer({
+          rawAnswer: quickAnswer,
+          decision: decisionResult.decision,
+          webResult,
+        });
+        logInfo(
+          TAG,
+          'Fast path web concluido sem inferencia local',
+          `query=${decisionResult.query}\nfontes=${composedQuick.sources.length}`,
+        );
+        return {
+          text: composedQuick.text,
+          sources: composedQuick.sources,
+          searchDecision: decisionResult.decision,
+          webValidationStatus: composedQuick.webValidationStatus,
+        };
+      }
+    } else {
+      logWarn(
+        TAG,
+        'Fast path web excedeu tempo inicial e caiu para fluxo completo',
+        `query=${decisionResult.query}`,
+      );
+    }
+  }
+
   try {
     logInfo(TAG, 'Checagem de runtime/modelo iniciada');
     runtimeReady = await runtimeReadyPromise;
@@ -577,6 +721,19 @@ export async function generateResponsePackageStream(
   }
 
   try {
+    if (!webResult && webSearchPromise) {
+      const webResultAttempt = await waitPromiseWithTimeout(webSearchPromise, WEB_RESULT_WAIT_MS);
+      if (!webResultAttempt.timedOut) {
+        webResult = webResultAttempt.value;
+      } else {
+        logWarn(
+          TAG,
+          'Busca web excedeu o limite de espera da composicao; seguindo com fallback seguro',
+          `query=${decisionResult.query}`,
+        );
+      }
+    }
+
     const augmentation = buildPromptAugmentation(decisionResult.decision, webResult);
     logInfo(TAG, 'Inicio da inferencia via runtime local');
     const response = await inferWithLocalRuntime(
@@ -675,8 +832,11 @@ export async function generateResponsePackageStream(
     };
   } catch (error) {
     logError(TAG, 'Falha na inferencia local, aplicando fallback seguro', toErrorDetails(error));
-    if (!webResult && decisionResult.decision === 'local_plus_web' && decisionResult.query) {
-      webResult = await searchWeb(decisionResult.query);
+    if (!webResult && webSearchPromise) {
+      const webRecovery = await waitPromiseWithTimeout(webSearchPromise, WEB_RESULT_RECOVERY_WAIT_MS);
+      if (!webRecovery.timedOut) {
+        webResult = webRecovery.value;
+      }
     }
     const fallbackComposed = composeAnswer({
       rawAnswer: RUNTIME_FAILURE_FALLBACK,

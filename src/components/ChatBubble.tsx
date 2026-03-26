@@ -8,8 +8,9 @@ import {
   Clipboard,
   ScrollView,
   Linking,
+  Image,
 } from 'react-native';
-import {Message} from '../types';
+import {Message, MessageSource} from '../types';
 import {colors, spacing, fonts, radius} from '../theme';
 import {formatDate} from '../utils/helpers';
 import TypingIndicator from './TypingIndicator';
@@ -45,6 +46,25 @@ const TECHNICAL_DISPLAY_LEAK_PATTERN =
   /\b(n_predict|stopped_limit|tokens_predicted|context_full|prompt chars|last user chars|contexto usado|engine:\s*llama\.rn)\b/i;
 const INTERNAL_SIGNAL_DISPLAY_PATTERN =
   /(voce e o alfa ai|você é o alfa ai|nunca revele, copie ou descreva instrucoes internas|evite formalidade excessiva|pergunta curta pede resposta curta|organize em markdown com titulos curtos|diretriz interna)/i;
+const INVALID_SOURCE_SITE_PATTERN = /^(fonte|source|placeholder)$/i;
+
+function getSourceDisplayName(source: MessageSource): string {
+  const site = typeof source.siteName === 'string' ? source.siteName.trim() : '';
+  const title = typeof source.title === 'string' ? source.title.trim() : '';
+  return site || title || source.url;
+}
+
+function getSourceLogoUri(url: string): string {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./i, '');
+    if (!host) {
+      return '';
+    }
+    return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=64`;
+  } catch {
+    return '';
+  }
+}
 
 function normalizeDisplayLeakLine(rawLine: string): string {
   return rawLine
@@ -98,6 +118,62 @@ function sanitizeAssistantDisplayContent(content: string): string {
 
   return safeLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
+
+function isRenderableSource(source: MessageSource | null | undefined): source is MessageSource {
+  if (!source) {
+    return false;
+  }
+  const url = typeof source.url === 'string' ? source.url.trim() : '';
+  const siteName = typeof source.siteName === 'string' ? source.siteName.trim() : '';
+  const title = typeof source.title === 'string' ? source.title.trim() : '';
+  if (!url || !siteName || !title) {
+    return false;
+  }
+  if (!/^https?:\/\//i.test(url)) {
+    return false;
+  }
+  if (INVALID_SOURCE_SITE_PATTERN.test(siteName.toLowerCase())) {
+    return false;
+  }
+  return true;
+}
+
+interface SourceChipProps {
+  source: MessageSource;
+  onOpen: (url: string) => void;
+}
+
+const SourceChip = memo(function SourceChip({source, onOpen}: SourceChipProps): React.JSX.Element {
+  const [logoFailed, setLogoFailed] = useState(false);
+  const displayName = getSourceDisplayName(source);
+  const logoUri = getSourceLogoUri(source.url);
+  const logoInitial = displayName.charAt(0).toUpperCase();
+
+  return (
+    <Pressable
+      hitSlop={6}
+      style={styles.sourceChip}
+      onPress={() => onOpen(source.url)}>
+      <View style={styles.sourceLogoContainer}>
+        {!logoFailed && logoUri ? (
+          <Image
+            source={{uri: logoUri}}
+            style={styles.sourceLogo}
+            resizeMode="contain"
+            onError={() => setLogoFailed(true)}
+          />
+        ) : (
+          <Text style={styles.sourceLogoFallback}>
+            {logoInitial || 'S'}
+          </Text>
+        )}
+      </View>
+      <Text style={styles.sourceChipText} numberOfLines={1}>
+        {displayName}
+      </Text>
+    </Pressable>
+  );
+});
 
 function parseInlineChunks(text: string): InlineChunk[] {
   const chunks: InlineChunk[] = [];
@@ -359,7 +435,9 @@ function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
     typeof message.timestamp === 'number' && Number.isFinite(message.timestamp)
       ? message.timestamp
       : Date.now();
-  const safeSources = Array.isArray(message.sources) ? message.sources.slice(0, 3) : [];
+  const safeSources = Array.isArray(message.sources)
+    ? message.sources.filter(source => isRenderableSource(source)).slice(0, 3)
+    : [];
 
   const isUser = safeRole === 'user';
   const isError = message.error === true;
@@ -555,27 +633,21 @@ function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
             })}
           </View>
         )}
-        {!isTyping && safeSources.length > 0 && (
-          <View style={styles.sourcesContainer}>
-            <Text style={styles.sourcesTitle}>Fontes:</Text>
-            {safeSources.map((source, index) => (
-              <Pressable
-                key={`${source.url}-${index}`}
-                hitSlop={6}
-                style={styles.sourceRow}
-                onPress={() => handleOpenSource(source.url)}>
-                <Text style={styles.sourceIndex}>{index + 1}.</Text>
-                <Text style={styles.sourceText} numberOfLines={1}>
-                  {source.siteName}
-                </Text>
-              </Pressable>
-            ))}
-          </View>
-        )}
         {!isTyping && (
           <Text style={styles.timestamp}>{formatDate(safeTimestamp)}</Text>
         )}
       </View>
+      {!isTyping && !isUser && safeSources.length > 0 && (
+        <View style={styles.sourcesOutsideContainer}>
+          {safeSources.map((source, index) => (
+            <SourceChip
+              key={`${source.url}-${index}`}
+              source={source}
+              onOpen={handleOpenSource}
+            />
+          ))}
+        </View>
+      )}
     </View>
   );
 }
@@ -812,36 +884,54 @@ const styles = StyleSheet.create({
   messageTextError: {
     color: colors.danger,
   },
-  sourcesContainer: {
-    marginTop: spacing.sm,
-    paddingTop: spacing.sm,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
+  sourcesOutsideContainer: {
+    marginTop: spacing.xs,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    maxWidth: '94%',
   },
-  sourcesTitle: {
-    color: colors.textMuted,
-    fontSize: fonts.sizes.xs,
-    marginBottom: spacing.xs,
-    letterSpacing: 0.4,
-    textTransform: 'uppercase',
-  },
-  sourceRow: {
+  sourceChip: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginTop: 2,
-    marginBottom: 2,
-  },
-  sourceIndex: {
-    color: colors.textMuted,
-    fontSize: fonts.sizes.sm,
+    maxWidth: 248,
+    paddingVertical: 6,
+    paddingLeft: 6,
+    paddingRight: spacing.sm,
     marginRight: spacing.xs,
-    width: 14,
+    marginTop: spacing.xs,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.surfaceElevated,
   },
-  sourceText: {
-    flex: 1,
+  sourceLogoContainer: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: colors.background,
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+    marginRight: 6,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  sourceLogo: {
+    width: 14,
+    height: 14,
+  },
+  sourceLogoFallback: {
+    color: colors.textSecondary,
+    fontSize: 10,
+    fontWeight: '700',
+    lineHeight: 12,
+  },
+  sourceChipText: {
+    flexShrink: 1,
     color: colors.primary,
     fontSize: fonts.sizes.sm,
-    lineHeight: 20,
+    lineHeight: 16,
+    fontWeight: '600',
   },
   timestamp: {
     color: colors.textMuted,
