@@ -75,9 +75,10 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
         if (conv.id !== action.conversationId) {
           return conv;
         }
+        const baseMessages = Array.isArray(conv.messages) ? conv.messages : [];
         return {
           ...conv,
-          messages: [...conv.messages, action.message],
+          messages: [...baseMessages, action.message],
           updatedAt: Date.now(),
         };
       });
@@ -89,7 +90,7 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
         if (conv.id !== action.conversationId) {
           return conv;
         }
-        const messages = [...conv.messages];
+        const messages = Array.isArray(conv.messages) ? [...conv.messages] : [];
         if (messages.length === 0) {
           return conv;
         }
@@ -148,7 +149,7 @@ const initialState: ChatState = {
 
 interface ChatContextValue {
   state: ChatState;
-  createConversation: () => string;
+  createConversation: () => string | null;
   setCurrentConversation: (id: string | null) => void;
   addMessage: (conversationId: string, message: Omit<Message, 'id' | 'timestamp'>) => Message;
   updateLastMessage: (conversationId: string, content: string, error?: boolean) => void;
@@ -158,6 +159,35 @@ interface ChatContextValue {
 }
 
 const ChatContext = createContext<ChatContextValue | undefined>(undefined);
+
+function toErrorDetails(error: unknown): string {
+  if (error instanceof Error) {
+    return `${error.message}\n${error.stack ?? 'stack indisponivel'}`;
+  }
+  return String(error);
+}
+
+function normalizeConversation(
+  raw: Partial<Conversation> | null | undefined,
+): Conversation | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const fallbackId = generateId();
+  const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : fallbackId;
+  const title = typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : 'Nova Conversa';
+  const messages = Array.isArray(raw.messages) ? raw.messages : [];
+  const now = Date.now();
+  const createdAt = typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)
+    ? raw.createdAt
+    : now;
+  const updatedAt = typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)
+    ? raw.updatedAt
+    : createdAt;
+
+  return {id, title, messages, createdAt, updatedAt};
+}
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -173,24 +203,38 @@ export function ChatProvider({children}: ChatProviderProps): React.JSX.Element {
   // Load persisted data on mount
   useEffect(() => {
     async function init() {
-      logInfo(TAG, 'Initializing chat store');
-      const [conversations, currentId] = await Promise.all([
-        loadConversations(),
-        loadCurrentConversationId(),
-      ]);
+      try {
+        logInfo(TAG, 'Inicializacao do chat store iniciada');
+        const [loadedConversations, loadedCurrentId] = await Promise.all([
+          loadConversations(),
+          loadCurrentConversationId(),
+        ]);
+        logInfo(TAG, 'Carga inicial de conversas concluida');
 
-      // Validate currentId exists in conversations
-      const validCurrentId =
-        currentId && conversations.some(c => c.id === currentId)
-          ? currentId
-          : conversations.length > 0
-          ? conversations[0].id
-          : null;
+        const conversations = loadedConversations
+          .map(conv => normalizeConversation(conv))
+          .filter((conv): conv is Conversation => conv !== null);
 
-      dispatch({type: 'INIT', conversations, currentId: validCurrentId});
-      logInfo(TAG, `Loaded ${conversations.length} conversations`);
+        // Validate currentId exists in conversations
+        const validCurrentId =
+          loadedCurrentId && conversations.some(c => c.id === loadedCurrentId)
+            ? loadedCurrentId
+            : conversations.length > 0
+            ? conversations[0].id
+            : null;
+
+        dispatch({type: 'INIT', conversations, currentId: validCurrentId});
+        logInfo(
+          TAG,
+          'Inicializacao do chat store concluida',
+          `conversas=${conversations.length} currentId=${validCurrentId ?? 'null'}`,
+        );
+      } catch (error) {
+        logError(TAG, 'Falha na inicializacao do chat store', toErrorDetails(error));
+        dispatch({type: 'INIT', conversations: [], currentId: null});
+      }
     }
-    init();
+    void init();
   }, []);
 
   // Auto-save whenever conversations change
@@ -222,23 +266,83 @@ export function ChatProvider({children}: ChatProviderProps): React.JSX.Element {
     if (!state.isInitialized || state.currentConversationId === null) {
       return;
     }
-    saveCurrentConversationId(state.currentConversationId);
+    void (async () => {
+      try {
+        logInfo(
+          TAG,
+          'Persistencia do currentConversationId iniciada',
+          state.currentConversationId,
+        );
+        await saveCurrentConversationId(state.currentConversationId);
+        logInfo(TAG, 'Persistencia do currentConversationId concluida');
+      } catch (error) {
+        logError(
+          TAG,
+          'Persistencia do currentConversationId falhou',
+          toErrorDetails(error),
+        );
+      }
+    })();
   }, [state.currentConversationId, state.isInitialized]);
 
-  const createConversation = useCallback((): string => {
-    const id = generateId();
-    const now = Date.now();
-    const conversation: Conversation = {
-      id,
-      title: 'Nova Conversa',
-      messages: [],
-      createdAt: now,
-      updatedAt: now,
-    };
-    dispatch({type: 'CREATE_CONVERSATION', conversation});
-    logInfo(TAG, `Created conversation: ${id}`);
-    return id;
-  }, []);
+  const createConversation = useCallback((): string | null => {
+    try {
+      logInfo(TAG, 'Criacao de nova conversa iniciada');
+
+      logInfo(TAG, 'Geracao do id da conversa iniciada');
+      const generatedId = generateId();
+      logInfo(TAG, 'Geracao do id da conversa concluida', generatedId);
+
+      logInfo(TAG, 'Criacao do objeto da conversa iniciada');
+      const now = Date.now();
+      const rawConversation: Conversation = {
+        id: generatedId,
+        title: 'Nova Conversa',
+        messages: [],
+        createdAt: now,
+        updatedAt: now,
+      };
+      logInfo(TAG, 'Criacao do objeto da conversa concluida');
+
+      logInfo(TAG, 'Validacao da nova conversa iniciada');
+      const conversation = normalizeConversation(rawConversation);
+      if (!conversation) {
+        logError(TAG, 'Validacao da nova conversa falhou: objeto invalido');
+        return null;
+      }
+      logInfo(
+        TAG,
+        'Validacao da nova conversa concluida',
+        `id=${conversation.id} title=${conversation.title} messages=${conversation.messages.length} updatedAt=${conversation.updatedAt}`,
+      );
+
+      logInfo(TAG, 'Atualizacao do store iniciada');
+      dispatch({type: 'CREATE_CONVERSATION', conversation});
+      logInfo(TAG, 'Atualizacao do store concluida');
+      logInfo(TAG, 'Selecao da conversa atual concluida', conversation.id);
+
+      void (async () => {
+        try {
+          logInfo(TAG, 'Persistencia no storage iniciada');
+          const nextConversations = [conversation, ...state.conversations];
+          await saveConversations(nextConversations);
+          await saveCurrentConversationId(conversation.id);
+          logInfo(TAG, 'Persistencia no storage concluida');
+        } catch (error) {
+          logError(
+            TAG,
+            'Persistencia no storage falhou; conversa mantida em memoria',
+            toErrorDetails(error),
+          );
+        }
+      })();
+
+      return conversation.id;
+    } catch (error) {
+      logError(TAG, 'Catch no fluxo de criacao de nova conversa', toErrorDetails(error));
+      return null;
+    }
+  }, [state.conversations]);
 
   const setCurrentConversation = useCallback((id: string | null) => {
     dispatch({type: 'SET_CURRENT_CONVERSATION', id});

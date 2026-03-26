@@ -1,4 +1,4 @@
-import React, {useState, useCallback, useRef, useEffect} from 'react';
+import React, {useState, useCallback, useRef, useEffect, useMemo} from 'react';
 import {
   View,
   FlatList,
@@ -48,11 +48,22 @@ export default function ChatScreen(): React.JSX.Element {
   const [inputText, setInputText] = useState('');
   const flatListRef = useRef<FlatList<Message>>(null);
 
-  // Resolve active conversation ID from route params or store
-  const conversationId =
-    route.params?.conversationId ?? state.currentConversationId ?? '';
+  // Resolve active conversation ID safely from route params/store/list
+  const conversationId = useMemo(() => {
+    const routeId = route.params?.conversationId;
+    if (routeId && state.conversations.some(c => c.id === routeId)) {
+      return routeId;
+    }
+    if (
+      state.currentConversationId &&
+      state.conversations.some(c => c.id === state.currentConversationId)
+    ) {
+      return state.currentConversationId;
+    }
+    return state.conversations[0]?.id ?? '';
+  }, [route.params?.conversationId, state.currentConversationId, state.conversations]);
 
-  const conversation = state.conversations.find(c => c.id === conversationId);
+  const conversation = state.conversations.find(c => c.id === conversationId) ?? null;
   const messages = conversation?.messages ?? [];
   const isLoading = state.isLoading;
 

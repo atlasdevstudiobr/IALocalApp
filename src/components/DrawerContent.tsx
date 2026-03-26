@@ -17,8 +17,17 @@ import {Conversation} from '../types';
 import {colors, spacing, fonts, radius} from '../theme';
 import {truncateText, formatDate} from '../utils/helpers';
 import {RootStackParamList} from '../navigation/AppNavigator';
+import {logError, logInfo} from '../services/logService';
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
+const TAG = 'DrawerContent';
+
+function toErrorDetails(error: unknown): string {
+  if (error instanceof Error) {
+    return `${error.message}\n${error.stack ?? 'stack indisponivel'}`;
+  }
+  return String(error);
+}
 
 interface Section {
   title: string;
@@ -69,9 +78,27 @@ export default function DrawerContent(
   }, [state.conversations]);
 
   const handleNewConversation = useCallback(() => {
-    const id = createConversation();
-    setCurrentConversation(id);
-    navigation.navigate('Chat', {conversationId: id});
+    try {
+      logInfo(TAG, 'Clique em Nova Conversa recebido');
+      const id = createConversation();
+      if (!id) {
+        logError(TAG, 'Falha ao criar conversa: id invalido');
+        return;
+      }
+      logInfo(TAG, 'Criacao da conversa no store concluida', id);
+
+      logInfo(TAG, 'Selecao da conversa atual iniciada', id);
+      setCurrentConversation(id);
+      logInfo(TAG, 'Selecao da conversa atual concluida', id);
+
+      logInfo(TAG, 'Atualizacao da UI iniciada (navegacao para Chat)', id);
+      navigation.navigate('Chat', {conversationId: id});
+      logInfo(TAG, 'Atualizacao da UI concluida (navegacao para Chat)', id);
+    } catch (error) {
+      logError(TAG, 'Catch no fluxo de Nova Conversa', toErrorDetails(error));
+    } finally {
+      logInfo(TAG, 'Fluxo de Nova Conversa finalizado');
+    }
   }, [createConversation, setCurrentConversation, navigation]);
 
   const handleSelectConversation = useCallback(

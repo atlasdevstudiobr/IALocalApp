@@ -13,8 +13,17 @@ import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 import {useChatStore} from '../store/chatStore';
 import {colors, spacing, fonts, radius} from '../theme';
 import {RootStackParamList} from '../navigation/AppNavigator';
+import {logError, logInfo} from '../services/logService';
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
+const TAG = 'HomeScreen';
+
+function toErrorDetails(error: unknown): string {
+  if (error instanceof Error) {
+    return `${error.message}\n${error.stack ?? 'stack indisponivel'}`;
+  }
+  return String(error);
+}
 
 export default function HomeScreen(): React.JSX.Element {
   const insets = useSafeAreaInsets();
@@ -54,9 +63,27 @@ export default function HomeScreen(): React.JSX.Element {
   });
 
   const handleStartChat = useCallback(() => {
-    const id = createConversation();
-    setCurrentConversation(id);
-    navigation.navigate('Chat', {conversationId: id});
+    try {
+      logInfo(TAG, 'Clique em Iniciar Conversa recebido');
+      const id = createConversation();
+      if (!id) {
+        logError(TAG, 'Falha ao iniciar conversa: id invalido');
+        return;
+      }
+      logInfo(TAG, 'Criacao da conversa no store concluida', id);
+
+      logInfo(TAG, 'Selecao da conversa atual iniciada', id);
+      setCurrentConversation(id);
+      logInfo(TAG, 'Selecao da conversa atual concluida', id);
+
+      logInfo(TAG, 'Atualizacao da UI iniciada (navegacao para Chat)', id);
+      navigation.navigate('Chat', {conversationId: id});
+      logInfo(TAG, 'Atualizacao da UI concluida (navegacao para Chat)', id);
+    } catch (error) {
+      logError(TAG, 'Catch no fluxo de Iniciar Conversa', toErrorDetails(error));
+    } finally {
+      logInfo(TAG, 'Fluxo de Iniciar Conversa finalizado');
+    }
   }, [createConversation, setCurrentConversation, navigation]);
 
   const handleOpenDrawer = useCallback(() => {

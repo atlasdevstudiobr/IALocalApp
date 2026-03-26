@@ -19,6 +19,7 @@ export async function saveConversations(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logError(TAG, 'Failed to save conversations', message);
+    throw error;
   }
 }
 
@@ -54,6 +55,7 @@ export async function saveCurrentConversationId(id: string): Promise<void> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logError(TAG, 'Failed to save current conversation ID', message);
+    throw error;
   }
 }
 
