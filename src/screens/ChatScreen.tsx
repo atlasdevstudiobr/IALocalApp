@@ -15,8 +15,8 @@ import {NativeStackNavigationProp} from '@react-navigation/native-stack';
 
 import {Message} from '../types';
 import {useChatStore} from '../store/chatStore';
-import {generateResponsePackageStream, warmupRuntimeSafely} from '../services/aiService';
-import {logError, logInfo} from '../services/logService';
+import {generateResponsePackageStream} from '../services/aiService';
+import {logError} from '../services/logService';
 import ChatBubble from '../components/ChatBubble';
 import ChatInput from '../components/ChatInput';
 import {useKeyboardHeight} from '../hooks/useKeyboardHeight';
@@ -30,9 +30,35 @@ type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 const TAG = 'ChatScreen';
 const SEND_FALLBACK_MESSAGE =
   'Não consegui responder agora. Verifique a conexão e tente novamente.';
-const STREAM_ANIMATION_FRAME_MS = 28;
-const STREAM_MAX_CHARS_PER_TICK = 8;
-const MAX_RUNTIME_MESSAGES = 12;
+const STREAM_FLUSH_FRAME_MS = 80;
+const MAX_MESSAGES_FOR_CONTEXT = 12;
+
+function mergeStreamPiece(current: string, incoming: string): string {
+  if (!incoming) {
+    return current;
+  }
+  if (!current) {
+    return incoming;
+  }
+  if (incoming === current) {
+    return current;
+  }
+  if (incoming.startsWith(current)) {
+    return incoming;
+  }
+  if (current.startsWith(incoming)) {
+    return current;
+  }
+
+  const overlapLimit = Math.min(current.length, incoming.length);
+  for (let overlap = overlapLimit; overlap > 0; overlap -= 1) {
+    if (current.endsWith(incoming.slice(0, overlap))) {
+      return `${current}${incoming.slice(overlap)}`;
+    }
+  }
+
+  return `${current}${incoming}`;
+}
 
 function toErrorDetails(error: unknown): string {
   if (error instanceof Error) {
@@ -84,11 +110,11 @@ export default function ChatScreen(): React.JSX.Element {
     () => [...visibleMessages].reverse(),
     [visibleMessages],
   );
-  const runtimeMessagesForInference = useMemo(() => {
-    if (visibleMessages.length <= MAX_RUNTIME_MESSAGES) {
+  const messagesForInference = useMemo(() => {
+    if (visibleMessages.length <= MAX_MESSAGES_FOR_CONTEXT) {
       return visibleMessages;
     }
-    return visibleMessages.slice(-MAX_RUNTIME_MESSAGES);
+    return visibleMessages.slice(-MAX_MESSAGES_FOR_CONTEXT);
   }, [visibleMessages]);
   const isLoading = state.isLoading;
   // Em Android, inverted + maintainVisibleContentPosition pode causar crash nativo da lista.
@@ -102,86 +128,85 @@ export default function ChatScreen(): React.JSX.Element {
     }
   }, [conversationId, state.currentConversationId, setCurrentConversation]);
 
-  useEffect(() => {
-    void (async () => {
-      try {
-        logInfo(TAG, 'Warmup do runtime disparado fora do clique em enviar');
-        await warmupRuntimeSafely();
-        logInfo(TAG, 'Warmup do runtime finalizado no mount do ChatScreen');
-      } catch (error) {
-        logError(TAG, 'Erro no warmup do ChatScreen', toErrorDetails(error));
-      }
-    })();
-  }, []);
-
   const handleSend = useCallback(async () => {
     let targetConversationId = conversationId;
     let assistantPlaceholderCreated = false;
-    let streamTimer: ReturnType<typeof setTimeout> | null = null;
+    let streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
     let streamTargetText = '';
-    let streamDisplayedText = '';
-    let streamAnimationRunning = false;
+    let streamRenderedText = '';
 
-    const stopStreamAnimation = () => {
-      if (streamTimer) {
-        clearTimeout(streamTimer);
-        streamTimer = null;
+    const stopStreamFlush = () => {
+      if (streamFlushTimer) {
+        clearTimeout(streamFlushTimer);
+        streamFlushTimer = null;
       }
-      streamAnimationRunning = false;
     };
 
-    const getCharsPerTick = (): number => {
-      const backlog = streamTargetText.length - streamDisplayedText.length;
-      if (backlog >= 120) {
-        return STREAM_MAX_CHARS_PER_TICK;
+    const flushStreamNow = (touchUpdatedAt: boolean) => {
+      if (!targetConversationId || !assistantPlaceholderCreated || !streamTargetText) {
+        return streamRenderedText;
       }
-      if (backlog >= 64) {
-        return 6;
+      if (!touchUpdatedAt && streamRenderedText === streamTargetText) {
+        return streamRenderedText;
       }
-      if (backlog >= 24) {
-        return 4;
+      streamRenderedText = streamTargetText;
+      updateLastMessage(targetConversationId, streamRenderedText, {
+        isStreaming: true,
+        touchUpdatedAt,
+      });
+      if (!touchUpdatedAt) {
+        scrollToLatest(false);
       }
-      return 2;
+      return streamRenderedText;
     };
 
-    const animateStreamStep = () => {
-      if (!targetConversationId || !assistantPlaceholderCreated) {
-        stopStreamAnimation();
+    const scheduleStreamFlush = () => {
+      if (streamFlushTimer) {
         return;
       }
-      if (streamDisplayedText.length >= streamTargetText.length) {
-        stopStreamAnimation();
-        return;
-      }
-
-      const nextLength = Math.min(
-        streamTargetText.length,
-        streamDisplayedText.length + getCharsPerTick(),
-      );
-      streamDisplayedText = streamTargetText.slice(0, nextLength);
-      updateLastMessage(targetConversationId, streamDisplayedText, {touchUpdatedAt: false});
-      scrollToLatest(false);
-
-      if (streamDisplayedText.length >= streamTargetText.length) {
-        stopStreamAnimation();
-        return;
-      }
-      streamTimer = setTimeout(animateStreamStep, STREAM_ANIMATION_FRAME_MS);
+      streamFlushTimer = setTimeout(() => {
+        streamFlushTimer = null;
+        flushStreamNow(false);
+        if (streamTargetText !== streamRenderedText) {
+          scheduleStreamFlush();
+        }
+      }, STREAM_FLUSH_FRAME_MS);
     };
 
-    const scheduleStreamUpdate = (partialText: string) => {
+    const registerPartial = (partialText: string) => {
       if (!partialText) {
         return;
       }
-      const nextTarget = partialText;
-      if (nextTarget.length < streamTargetText.length && streamTargetText.startsWith(nextTarget)) {
+
+      if (!streamTargetText) {
+        streamTargetText = partialText;
+        scheduleStreamFlush();
         return;
       }
-      streamTargetText = nextTarget;
-      if (!streamAnimationRunning) {
-        streamAnimationRunning = true;
-        animateStreamStep();
+
+      if (partialText.startsWith(streamTargetText)) {
+        streamTargetText = partialText;
+        scheduleStreamFlush();
+        return;
       }
+
+      if (streamTargetText.startsWith(partialText)) {
+        return;
+      }
+
+      streamTargetText = mergeStreamPiece(streamTargetText, partialText);
+      scheduleStreamFlush();
+    };
+
+    const hasPartialContent = (): boolean => {
+      return Boolean(streamTargetText.trim() || streamRenderedText.trim());
+    };
+
+    const getBestPartial = (): string => {
+      if (streamTargetText.trim()) {
+        return streamTargetText;
+      }
+      return streamRenderedText;
     };
 
     try {
@@ -201,11 +226,12 @@ export default function ChatScreen(): React.JSX.Element {
       addMessage(targetConversationId, {
         role: 'assistant',
         content: '',
+        isStreaming: true,
       });
       assistantPlaceholderCreated = true;
 
       const allMessages = [
-        ...runtimeMessagesForInference,
+        ...messagesForInference,
         {
           id: 'temp-user',
           role: 'user' as const,
@@ -220,22 +246,33 @@ export default function ChatScreen(): React.JSX.Element {
           if (!partialText) {
             return;
           }
-          scheduleStreamUpdate(partialText);
+          registerPartial(partialText);
         },
       );
-      stopStreamAnimation();
+      stopStreamFlush();
+      flushStreamNow(false);
 
-      if (!responsePackage.text) {
+      const finalText = responsePackage.text || getBestPartial();
+      if (!finalText) {
         logError(TAG, 'generateResponsePackageStream retornou texto vazio no ChatScreen');
-        updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, {
-          error: true,
-          touchUpdatedAt: true,
-        });
+        if (hasPartialContent()) {
+          updateLastMessage(targetConversationId, getBestPartial(), {
+            isStreaming: false,
+            touchUpdatedAt: true,
+          });
+        } else {
+          updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, {
+            isStreaming: false,
+            error: true,
+            touchUpdatedAt: true,
+          });
+        }
         scrollToLatest(true);
         return;
       }
 
-      updateLastMessage(targetConversationId, responsePackage.text, {
+      updateLastMessage(targetConversationId, finalText, {
+        isStreaming: false,
         sources: responsePackage.sources,
         searchDecision: responsePackage.searchDecision,
         webValidationStatus: responsePackage.webValidationStatus,
@@ -244,13 +281,22 @@ export default function ChatScreen(): React.JSX.Element {
       scrollToLatest(true);
     } catch (error) {
       logError(TAG, 'Catch no fluxo de envio do chat', toErrorDetails(error));
-      stopStreamAnimation();
+      stopStreamFlush();
+      flushStreamNow(false);
       if (targetConversationId) {
         if (assistantPlaceholderCreated) {
-          updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, {
-            error: true,
-            touchUpdatedAt: true,
-          });
+          if (hasPartialContent()) {
+            updateLastMessage(targetConversationId, getBestPartial(), {
+              isStreaming: false,
+              touchUpdatedAt: true,
+            });
+          } else {
+            updateLastMessage(targetConversationId, SEND_FALLBACK_MESSAGE, {
+              isStreaming: false,
+              error: true,
+              touchUpdatedAt: true,
+            });
+          }
           scrollToLatest(true);
         } else {
           addMessage(targetConversationId, {
@@ -269,7 +315,7 @@ export default function ChatScreen(): React.JSX.Element {
     inputText,
     isLoading,
     conversationId,
-    runtimeMessagesForInference,
+    messagesForInference,
     addMessage,
     updateLastMessage,
     setLoading,

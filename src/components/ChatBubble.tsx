@@ -441,6 +441,7 @@ function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
 
   const isUser = safeRole === 'user';
   const isError = message.error === true;
+  const isStreaming = !isUser && message.isStreaming === true && !isError;
   const sanitizedAssistantContent = useMemo(
     () => (isUser || isLocalSafetyDisabled ? rawContent : sanitizeAssistantDisplayContent(rawContent)),
     [isUser, rawContent, isLocalSafetyDisabled],
@@ -449,8 +450,15 @@ function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
     !isUser && !isLocalSafetyDisabled && rawContent.trim() && !sanitizedAssistantContent.trim()
       ? DISPLAY_SANITIZATION_FALLBACK
       : sanitizedAssistantContent;
+  const streamSafeContent =
+    isLocalSafetyDisabled || sanitizedAssistantContent.trim()
+      ? sanitizedAssistantContent
+      : rawContent;
   const isTyping = !isUser && rawContent.trim() === '' && !isError;
-  const markdownBlocks = useMemo(() => parseMarkdownBlocks(safeContent), [safeContent]);
+  const markdownBlocks = useMemo(
+    () => (isStreaming ? [] : parseMarkdownBlocks(safeContent)),
+    [isStreaming, safeContent],
+  );
 
   const renderInline = useCallback((text: string, keyPrefix: string): React.ReactNode[] => {
     const chunks = parseInlineChunks(text);
@@ -530,6 +538,14 @@ function ChatBubble({message}: ChatBubbleProps): React.JSX.Element {
         ]}>
         {isTyping ? (
           <TypingIndicator />
+        ) : isStreaming ? (
+          <View style={styles.messageBody}>
+            <Text
+              selectable
+              style={[styles.messageText, styles.streamingText, isError && styles.messageTextError]}>
+              {streamSafeContent.replace(/\r\n/g, '\n')}
+            </Text>
+          </View>
         ) : (
           <View style={styles.messageBody}>
             {markdownBlocks.map((block, blockIndex) => {
@@ -667,6 +683,7 @@ function areEqual(prev: ChatBubbleProps, next: ChatBubbleProps): boolean {
     prev.message.id === next.message.id &&
     prev.message.role === next.message.role &&
     prev.message.content === next.message.content &&
+    prev.message.isStreaming === next.message.isStreaming &&
     prev.message.timestamp === next.message.timestamp &&
     prev.message.error === next.message.error &&
     prev.message.webValidationStatus === next.message.webValidationStatus &&
@@ -694,12 +711,18 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.md,
     paddingHorizontal: spacing.lg,
     borderWidth: 1,
+    minWidth: 72,
   },
   bubbleUserSizing: {
     maxWidth: '84%',
+    minWidth: '22%',
+    alignSelf: 'flex-end',
   },
   bubbleAssistantSizing: {
     maxWidth: '94%',
+    width: '94%',
+    minWidth: '38%',
+    alignSelf: 'flex-start',
   },
   bubbleUser: {
     backgroundColor: colors.userBubble,
@@ -723,14 +746,25 @@ const styles = StyleSheet.create({
     color: colors.text,
     fontSize: fonts.sizes.base,
     lineHeight: 22,
+    width: '100%',
+    includeFontPadding: false,
   },
   messageBody: {
     paddingTop: 2,
+    width: '100%',
+    minWidth: 0,
   },
   paragraphText: {
     fontSize: fonts.sizes.base,
     lineHeight: 25,
     marginBottom: spacing.lg,
+    width: '100%',
+  },
+  streamingText: {
+    fontSize: fonts.sizes.base,
+    lineHeight: 24,
+    marginBottom: spacing.sm,
+    width: '100%',
   },
   headingBlock: {
     marginTop: spacing.sm,
@@ -786,6 +820,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-start',
     marginBottom: spacing.md,
+    width: '100%',
+    minWidth: 0,
   },
   listMarker: {
     color: colors.text,
@@ -803,6 +839,8 @@ const styles = StyleSheet.create({
   },
   listText: {
     flex: 1,
+    minWidth: 0,
+    flexShrink: 1,
     lineHeight: 26,
   },
   divider: {
