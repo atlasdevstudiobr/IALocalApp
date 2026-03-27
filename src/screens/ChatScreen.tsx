@@ -28,7 +28,8 @@ type ChatScreenRouteProp = RouteProp<RootStackParamList, 'Chat'>;
 type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
 const TAG = 'ChatScreen';
-const SEND_FALLBACK_MESSAGE = 'Falha ao carregar o runtime local. Veja os logs.';
+const SEND_FALLBACK_MESSAGE =
+  'Nao consegui responder agora. Verifique a conexao e tente novamente.';
 const STREAM_ANIMATION_FRAME_MS = 28;
 const STREAM_MAX_CHARS_PER_TICK = 8;
 const MAX_RUNTIME_MESSAGES = 12;

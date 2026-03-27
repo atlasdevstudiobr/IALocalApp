@@ -1,4 +1,5 @@
 import {Message, MessageSource, SearchDecision, WebValidationStatus} from '../types';
+import {REMOTE_CHAT_ENABLED} from '../config/serviceConfig';
 import * as LogService from './logService';
 import {loadModelDownloadState} from './modelDownloadService';
 import {
@@ -19,6 +20,7 @@ import {
   countValidWebSources,
   hasValidatedWebSources,
 } from './answerComposerService';
+import {logRemoteChatError, sendRemoteChatMessage} from './remoteChatService';
 
 const TAG = 'AIService';
 
@@ -78,6 +80,8 @@ const NON_DETERMINISTIC_TIME_TERMS_PATTERN =
   /\b(d[o\u00F3]lar|euro|bitcoin|btc|presidente|governador|ministro|prefeito|clima|temperatura|not[i\u00ED]cia)\b/i;
 const INCOMPLETE_ENDING_PATTERN =
   /\b(de|do|da|dos|das|para|com|sobre|que|e|ou|em|no|na|nos|nas|por|ao|aos|a|o)\.?$/i;
+const ASSISTANT_BRAND_PREFIX_PATTERN =
+  /^(?:\*\*|__)?\s*(?:alfa\s*ai|assistente)\s*(?:\*\*|__)?\s*[:\-]\s*/i;
 let runtimeBindingsInitialized = false;
 let warmupRuntimePromise: Promise<void> | null = null;
 let lastWarmupAt = 0;
@@ -570,6 +574,23 @@ function ensureNaturalResponseEnding(response: string): string {
   return normalized.trim();
 }
 
+function stripAssistantBrandPrefix(content: string): string {
+  let normalized = content.trim();
+  if (!normalized) {
+    return '';
+  }
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const next = normalized.replace(ASSISTANT_BRAND_PREFIX_PATTERN, '').trim();
+    if (next === normalized) {
+      break;
+    }
+    normalized = next;
+  }
+
+  return normalized;
+}
+
 function buildFinalResponse(rawResponse: string, lastUserContent: string): string {
   const normalizedResponse = softenInstitutionalOpeners(normalizeModelResponse(rawResponse));
   if (!normalizedResponse) {
@@ -597,6 +618,18 @@ function buildFinalResponse(rawResponse: string, lastUserContent: string): strin
   return finalized;
 }
 
+function buildRemoteFinalResponse(rawResponse: string): string {
+  const sanitized = normalizeModelResponse(stripAssistantBrandPrefix(rawResponse));
+  if (!sanitized) {
+    return '';
+  }
+  const softened = softenInstitutionalOpeners(sanitized);
+  const finalized = normalizeModelResponse(
+    ensureNaturalResponseEnding(stripAssistantBrandPrefix(softened)),
+  );
+  return finalized.trim();
+}
+
 function buildPartialResponse(rawPartial: string): string {
   return normalizeModelResponse(softenInstitutionalOpeners(rawPartial));
 }
@@ -621,6 +654,10 @@ function ensureRuntimeBindings(): void {
 }
 
 export async function warmupRuntimeSafely(): Promise<void> {
+  if (REMOTE_CHAT_ENABLED) {
+    return;
+  }
+
   ensureRuntimeBindings();
   const runtimeState = getRuntimeState();
   const now = Date.now();
@@ -669,11 +706,50 @@ export async function generateResponsePackageStream(
   messages: Message[],
   onPartial?: ResponseStreamCallback,
 ): Promise<GeneratedResponsePackage> {
+  const lastUserContent = getLastUserContent(messages);
+
+  if (REMOTE_CHAT_ENABLED) {
+    try {
+      logInfo(
+        TAG,
+        `Fluxo remoto prioritario ativo com ${messages.length} mensagem(ns)`,
+        `lastUserChars=${lastUserContent.length}`,
+      );
+      const remoteRawResponse = await sendRemoteChatMessage(
+        lastUserContent,
+        onPartial
+          ? (rawPartial: string) => {
+              const partialResponse = buildPartialResponse(
+                stripAssistantBrandPrefix(rawPartial),
+              );
+              if (!partialResponse.trim()) {
+                return;
+              }
+              onPartial(partialResponse);
+            }
+          : undefined,
+      );
+      const finalResponse = buildRemoteFinalResponse(remoteRawResponse);
+      if (!finalResponse) {
+        throw new Error('Resposta remota vazia apos sanitizacao');
+      }
+      return {
+        text: finalResponse,
+        sources: [],
+        searchDecision: 'local_only',
+        webValidationStatus: 'not_needed',
+      };
+    } catch (error) {
+      logRemoteChatError(error);
+      logError(TAG, 'Falha no fluxo remoto de chat', toErrorDetails(error));
+      throw error;
+    }
+  }
+
   ensureRuntimeBindings();
   const localSafetyDisabled = await loadLocalSafetyDisabled();
   const lastMessage = messages[messages.length - 1];
   const decisionResult = classifySearchDecision(messages);
-  const lastUserContent = getLastUserContent(messages);
   logInfo(
     TAG,
     `Entrada no AIService.generateResponsePackage com ${messages.length} mensagem(ns)`,
