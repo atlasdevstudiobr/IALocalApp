@@ -29,7 +29,7 @@ type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
 
 const TAG = 'ChatScreen';
 const SEND_FALLBACK_MESSAGE =
-  'Nao consegui responder agora. Verifique a conexao e tente novamente.';
+  'Não consegui responder agora. Verifique a conexão e tente novamente.';
 const STREAM_ANIMATION_FRAME_MS = 28;
 const STREAM_MAX_CHARS_PER_TICK = 8;
 const MAX_RUNTIME_MESSAGES = 12;
@@ -51,6 +51,16 @@ export default function ChatScreen(): React.JSX.Element {
 
   const [inputText, setInputText] = useState('');
   const flatListRef = useRef<FlatList<Message>>(null);
+  const scrollToLatest = useCallback((animated: boolean) => {
+    const runScroll = () => {
+      flatListRef.current?.scrollToOffset({offset: 0, animated});
+    };
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(runScroll);
+      return;
+    }
+    setTimeout(runScroll, 0);
+  }, []);
 
   // Resolve active conversation ID safely from route params/store/list
   const conversationId = useMemo(() => {
@@ -65,7 +75,7 @@ export default function ChatScreen(): React.JSX.Element {
   }, [route.params?.conversationId, state.currentConversationId, state.conversations]);
 
   const conversation = state.conversations.find(c => c.id === conversationId) ?? null;
-  const messages = Array.isArray(conversation?.messages) ? conversation.messages : [];
+  const messages = Array.isArray(conversation?.messages) ? (conversation?.messages ?? []) : [];
   const visibleMessages = useMemo(
     () => messages.filter(message => message?.role === 'user' || message?.role === 'assistant'),
     [messages],
@@ -150,6 +160,7 @@ export default function ChatScreen(): React.JSX.Element {
       );
       streamDisplayedText = streamTargetText.slice(0, nextLength);
       updateLastMessage(targetConversationId, streamDisplayedText, {touchUpdatedAt: false});
+      scrollToLatest(false);
 
       if (streamDisplayedText.length >= streamTargetText.length) {
         stopStreamAnimation();
@@ -220,6 +231,7 @@ export default function ChatScreen(): React.JSX.Element {
           error: true,
           touchUpdatedAt: true,
         });
+        scrollToLatest(true);
         return;
       }
 
@@ -229,6 +241,7 @@ export default function ChatScreen(): React.JSX.Element {
         webValidationStatus: responsePackage.webValidationStatus,
         touchUpdatedAt: true,
       });
+      scrollToLatest(true);
     } catch (error) {
       logError(TAG, 'Catch no fluxo de envio do chat', toErrorDetails(error));
       stopStreamAnimation();
@@ -238,17 +251,19 @@ export default function ChatScreen(): React.JSX.Element {
             error: true,
             touchUpdatedAt: true,
           });
+          scrollToLatest(true);
         } else {
           addMessage(targetConversationId, {
             role: 'assistant',
             content: SEND_FALLBACK_MESSAGE,
             error: true,
           });
+          scrollToLatest(true);
         }
       }
     } finally {
       setLoading(false);
-      flatListRef.current?.scrollToOffset({offset: 0, animated: true});
+      scrollToLatest(true);
     }
   }, [
     inputText,
@@ -258,6 +273,7 @@ export default function ChatScreen(): React.JSX.Element {
     addMessage,
     updateLastMessage,
     setLoading,
+    scrollToLatest,
   ]);
 
   const handleOpenDrawer = useCallback(() => {
